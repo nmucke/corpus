@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="description" content="A private, local view of your Hevy training history.">
+    <title>Corpus — Training in perspective</title>
+    <link rel="stylesheet" href="/styles.css">
+  </head>
+  <body>
+    <a class="skip-link" href="#main-content">Skip to content</a>
+    <div class="app-shell">
+      <aside class="sidebar" aria-label="Primary navigation">
+        <div class="brand-block">
+          <a class="brand" href="#overview" data-route="overview" aria-label="Corpus overview">
+            <span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i></span>
+            <span>corpus</span>
+          </a>
+          <p>Your training archive</p>
+        </div>
+
+        <nav class="primary-nav">
+          <a href="#overview" data-route="overview" class="is-active"><span class="nav-icon" aria-hidden="true">⌂</span>Overview</a>
+          <a href="#sessions" data-route="sessions"><span class="nav-icon" aria-hidden="true">◫</span>Sessions</a>
+          <a href="#programs" data-route="programs"><span class="nav-icon" aria-hidden="true">≡</span>Programs</a>
+          <a href="#exercises" data-route="exercises"><span class="nav-icon" aria-hidden="true">↗</span>Exercises</a>
+          <a href="#settings" data-route="settings"><span class="nav-icon" aria-hidden="true">⚙</span>Settings</a>
+        </nav>
+
+        <div class="future-nav" aria-label="Future features">
+          <p class="sidebar-label">Coming later</p>
+          <div><span>Nutrition</span><small>Soon</small></div>
+          <div><span>Supplements</span><small>Soon</small></div>
+          <div><span>Knowledge</span><small>Soon</small></div>
+        </div>
+
+        <div class="sidebar-foot">
+          <span class="privacy-dot" aria-hidden="true"></span>
+          <p><strong>Local by design</strong><br>Your key stays on this device.</p>
+        </div>
+      </aside>
+
+      <div class="workspace">
+        <header class="topbar">
+          <button class="mobile-menu icon-button" type="button" id="menu-button" aria-label="Open navigation" aria-expanded="false">☰</button>
+          <div class="mode-wrap">
+            <span class="mode-badge" id="mode-badge"><span></span>Loading</span>
+            <button class="text-button" type="button" id="mode-toggle" hidden></button>
+          </div>
+          <div class="top-actions">
+            <button class="button secondary" type="button" id="export-button">
+              <span aria-hidden="true">↓</span><span>Export Markdown</span>
+            </button>
+            <button class="button primary" type="button" id="sync-button">
+              <span class="sync-icon" aria-hidden="true">↻</span><span>Sync Hevy</span>
+            </button>
+          </div>
+        </header>
+
+        <main id="main-content" tabindex="-1">
+          <div class="loading-view" id="loading-view" role="status">
+            <span class="loader" aria-hidden="true"></span>
+            <p>Opening your training archive…</p>
+          </div>
+          <div id="view-root" hidden></div>
+        </main>
+      </div>
+    </div>
+
+    <div class="mobile-scrim" id="mobile-scrim" hidden></div>
+    <div class="toast-region" id="toast-region" aria-live="polite" aria-atomic="true"></div>
+
+    <dialog class="dialog" id="app-dialog" aria-labelledby="dialog-title">
+      <div class="dialog-shell">
+        <header class="dialog-header">
+          <div>
+            <p class="eyebrow" id="dialog-eyebrow"></p>
+            <h2 id="dialog-title"></h2>
+          </div>
+          <button class="icon-button dialog-close" type="button" aria-label="Close dialog">×</button>
+        </header>
+        <div class="dialog-body" id="dialog-body"></div>
+      </div>
+    </dialog>
+
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>

@@ -1,0 +1,16 @@
+{
+  "name": "corpus",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "A local-first home for your training data and health knowledge.",
+  "engines": { "node": ">=24.0.0" },
+  "scripts": {
+    "start": "node server/index.js",
+    "dev": "node --watch server/index.js",
+    "test": "node --test",
+    "sync": "node server/cli.js sync",
+    "export": "node server/cli.js export",
+    "status": "node server/cli.js status"
+  }
+}
