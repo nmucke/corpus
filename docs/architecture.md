@@ -35,11 +35,11 @@ The browser uses the following loopback-only endpoints. They are intentionally s
 | `POST` | `/api/routines` | Validate and publish a new Hevy routine, then cache the created record locally. |
 | `PUT` | `/api/routines/:id` | Validate changes to an imported routine and update the same Hevy routine and local record. |
 | `POST` | `/api/demo` | Select demo or live mode with `{ "enabled": true\|false }`. |
-| `POST` | `/api/programs` | Create or update a local program with ordered `{ label, routineId }` days. |
+| `POST` | `/api/programs` | Create or update a local program with ordered `{ label, routineId }` days and optional `start_date` / `duration_weeks`. |
 | `DELETE` | `/api/programs/:id` | Delete a local program in the active mode. |
 | `POST` | `/api/export` | Regenerate Markdown files under `data/exports/`. |
 
-Static `GET` requests serve the local HTML, CSS, and JavaScript interface. There is no browser endpoint that writes to Hevy.
+Static `GET` requests serve the local HTML, CSS, and JavaScript interface. Hevy writes go through the local routine endpoints, with credentials kept on the server.
 
 ## Structured storage
 
@@ -47,11 +47,15 @@ SQLite is the source of truth for the implemented workout module. The database i
 
 - imported Hevy workouts and their exercises and sets;
 - Hevy routines and exercise templates;
-- local programs, which group routines into ordered training days;
+- local programs, which group routines into ordered training days and optional dated training blocks;
 - sync metadata and source identifiers;
 - the selected demo/live mode.
 
 Unit preference and the saved API key live in the private `data/settings.json` file.
+
+Schema version 3 adds nullable `start_date` (`YYYY-MM-DD`) and `duration_weeks` (integer 1–52) to programs. Both values must be present or both null. Existing programs migrate to unscheduled without changing their days or IDs. Updates that omit both scheduling fields preserve the saved schedule; explicitly sending both null clears it.
+
+The shared `public/program-timeline.js` helpers derive inclusive end dates, statuses, and session associations. Calendar-day arithmetic avoids daylight-saving drift. A session belongs to each scheduled program with a matching routine ID and a date within the block, using the laptop's timezone. These associations are derived from the current program definition rather than persisted historical assignments. Program edits therefore recalculate them. Program weeks start on the block's start date, independently of the dashboard's Monday-based weeks. Each matching session counts once per program even if multiple days use its routine; overlapping programs may each count it. Program activity excludes future timestamps, and time progress counts calendar days through today rather than measuring adherence.
 
 The current `workouts`, `routines`, and `exercise_templates` table IDs are the corresponding Hevy IDs. `source_items` records the raw source payload for each imported item. A future second source will require a deliberate namespaced-ID migration; the current schema does not pretend to support multiple source systems.
 

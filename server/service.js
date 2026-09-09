@@ -4,8 +4,9 @@ import path from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import { demoState } from './demo.js';
 import { fetchSnapshot, postRoutine, updateRoutine as putRoutine, ROUTINE_UNCERTAIN_MESSAGE, ROUTINE_UPDATE_UNCERTAIN_MESSAGE } from './hevy.js';
+import { programTimeline, validateProgramSchedule } from '../public/program-timeline.js';
 
-const SCHEMA_VERSION = 2;
+const SCHEMA_VERSION = 3;
 const PROGRAM_TITLE_MAX = 160;
 const PROGRAM_DESCRIPTION_MAX = 4000;
 
@@ -31,6 +32,18 @@ function cleanText(value, max, name, required = false) {
 function isoNow() { return new Date().toISOString(); }
 function safeId(value) { return typeof value === 'string' && value.length > 0 && value.length <= 255; }
 
+function programSchedule(startDate, durationWeeks) {
+  const schedule = validateProgramSchedule(startDate, durationWeeks);
+  if (!schedule) throw new ServiceError('validation', 'Program schedule needs a real YYYY-MM-DD start date and a duration from 1 to 52 weeks, or both values must be null.');
+  return { start_date: schedule.startDate, duration_weeks: schedule.durationWeeks };
+}
+
+function programScheduleMarkdown(program, now = new Date()) {
+  const timeline = programTimeline(program, now);
+  if (!timeline.startDate) return ['- Schedule: Unscheduled'];
+  return [`- Schedule: ${timeline.startDate} to ${timeline.endDate} (${timeline.durationWeeks} weeks)`, `- Status: ${timeline.status.slice(0, 1).toUpperCase()}${timeline.status.slice(1)}`];
+}
+
 function initialise(db) {
   db.exec('PRAGMA foreign_keys = ON;');
   // Read this before applying migrations: opening a newer data directory must
@@ -49,10 +62,23 @@ function initialise(db) {
     CREATE TABLE IF NOT EXISTS routine_exercises (routine_id TEXT NOT NULL REFERENCES routines(id) ON DELETE CASCADE, exercise_index INTEGER NOT NULL, title TEXT, template_id TEXT, notes TEXT, rest_seconds REAL, raw_json TEXT NOT NULL, PRIMARY KEY(routine_id, exercise_index));
     CREATE TABLE IF NOT EXISTS routine_sets (routine_id TEXT NOT NULL, exercise_index INTEGER NOT NULL, set_index INTEGER NOT NULL, set_type TEXT, rep_range TEXT, raw_json TEXT NOT NULL, PRIMARY KEY(routine_id, exercise_index, set_index), FOREIGN KEY(routine_id, exercise_index) REFERENCES routine_exercises(routine_id, exercise_index) ON DELETE CASCADE);
     CREATE TABLE IF NOT EXISTS exercise_templates (id TEXT PRIMARY KEY, title TEXT, raw_json TEXT NOT NULL);
-    CREATE TABLE IF NOT EXISTS programs (id TEXT PRIMARY KEY, mode TEXT NOT NULL, title TEXT NOT NULL, description TEXT NOT NULL, days_json TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS programs (id TEXT PRIMARY KEY, mode TEXT NOT NULL, title TEXT NOT NULL, description TEXT NOT NULL, days_json TEXT NOT NULL, start_date TEXT, duration_weeks INTEGER, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS routine_publications (request_id TEXT PRIMARY KEY, payload_hash TEXT NOT NULL, status TEXT NOT NULL CHECK(status IN ('pending', 'succeeded', 'uncertain')), result_json TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);`);
-  if (!version) db.prepare('INSERT INTO meta(key, value) VALUES (?, ?)').run('schema_version', String(SCHEMA_VERSION));
-  else if (Number(version) < SCHEMA_VERSION) db.prepare('UPDATE meta SET value = ? WHERE key = ?').run(String(SCHEMA_VERSION), 'schema_version');
+  const programColumns = new Set(db.prepare('PRAGMA table_info(programs)').all().map((column) => column.name));
+  const needsMigration = !version || Number(version) < SCHEMA_VERSION || !programColumns.has('start_date') || !programColumns.has('duration_weeks');
+  if (needsMigration) {
+    try {
+      db.exec('BEGIN IMMEDIATE');
+      if (!programColumns.has('start_date')) db.exec('ALTER TABLE programs ADD COLUMN start_date TEXT');
+      if (!programColumns.has('duration_weeks')) db.exec('ALTER TABLE programs ADD COLUMN duration_weeks INTEGER');
+      if (!version) db.prepare('INSERT INTO meta(key, value) VALUES (?, ?)').run('schema_version', String(SCHEMA_VERSION));
+      else db.prepare('UPDATE meta SET value = ? WHERE key = ?').run(String(SCHEMA_VERSION), 'schema_version');
+      db.exec('COMMIT');
+    } catch (error) {
+      try { db.exec('ROLLBACK'); } catch { /* no transaction to roll back */ }
+      throw error;
+    }
+  }
   if (!db.prepare('SELECT value FROM meta WHERE key = ?').get('mode')) db.prepare('INSERT INTO meta(key, value) VALUES (?, ?)').run('mode', 'demo');
 }
 
@@ -303,6 +329,7 @@ function markdownFor(state) {
   const programLines = ['# Programs', '', demo];
   for (const program of state.programs) {
     programLines.push(`## ${program.title}`, '', program.description, '');
+    programLines.push(...programScheduleMarkdown(program), '');
     for (const day of program.days) programLines.push(`- ${day.label}: ${day.routineId}`);
     programLines.push('');
   }
@@ -332,7 +359,7 @@ export async function createService({ dataDir, fetchImpl = globalThis.fetch } = 
   const activeKey = () => process.env.HEVY_API_KEY || privateSettings.apiKey || null;
   const mode = () => getMeta('mode') === 'live' ? 'live' : 'demo';
   const publicSettings = () => ({ unit: privateSettings.unit === 'lb' ? 'lb' : 'kg', hasApiKey: Boolean(activeKey()), lastSync: getMeta('last_sync') });
-  const programs = (currentMode) => db.prepare('SELECT id, title, description, days_json, created_at, updated_at FROM programs WHERE mode = ? ORDER BY created_at').all(currentMode).map(({ days_json, ...program }) => ({ ...program, days: parse(days_json) }));
+  const programs = (currentMode) => db.prepare('SELECT id, title, description, days_json, start_date, duration_weeks, created_at, updated_at FROM programs WHERE mode = ? ORDER BY created_at').all(currentMode).map(({ days_json, ...program }) => ({ ...program, days: parse(days_json) }));
   const state = () => {
     const currentMode = mode();
     const data = currentMode === 'demo'
@@ -487,11 +514,17 @@ export async function createService({ dataDir, fetchImpl = globalThis.fetch } = 
         if (!safeId(day.routineId) || !routineIds.has(day.routineId)) throw new ServiceError('validation', `Unknown routine: ${String(day.routineId ?? '')}.`);
         return { label, routineId: day.routineId };
       });
-      const existing = body.id && safeId(body.id) ? db.prepare('SELECT id, created_at FROM programs WHERE id = ? AND mode = ?').get(body.id, currentMode) : null;
+      const existing = body.id && safeId(body.id) ? db.prepare('SELECT id, created_at, start_date, duration_weeks FROM programs WHERE id = ? AND mode = ?').get(body.id, currentMode) : null;
       if (body.id && !existing) throw new ServiceError('not_found', 'Program was not found.', 404);
+      const hasStartDate = Object.prototype.hasOwnProperty.call(body, 'start_date');
+      const hasDurationWeeks = Object.prototype.hasOwnProperty.call(body, 'duration_weeks');
+      if (hasStartDate !== hasDurationWeeks) throw new ServiceError('validation', 'Program schedule requires both start_date and duration_weeks, or neither field.');
+      const schedule = hasStartDate
+        ? programSchedule(body.start_date, body.duration_weeks)
+        : programSchedule(existing?.start_date ?? null, existing?.duration_weeks ?? null);
       const id = existing?.id ?? randomUUID(); const now = isoNow(); const created = existing?.created_at ?? now;
-      db.prepare('INSERT INTO programs(id, mode, title, description, days_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET title=excluded.title, description=excluded.description, days_json=excluded.days_json, updated_at=excluded.updated_at').run(id, currentMode, title, description, json(days), created, now);
-      return { id, title, description, days, created_at: created, updated_at: now };
+      db.prepare('INSERT INTO programs(id, mode, title, description, days_json, start_date, duration_weeks, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET title=excluded.title, description=excluded.description, days_json=excluded.days_json, start_date=excluded.start_date, duration_weeks=excluded.duration_weeks, updated_at=excluded.updated_at').run(id, currentMode, title, description, json(days), schedule.start_date, schedule.duration_weeks, created, now);
+      return { id, title, description, days, ...schedule, created_at: created, updated_at: now };
     },
     async deleteProgram(id) {
       if (!safeId(id)) throw new ServiceError('validation', 'Program id is invalid.');

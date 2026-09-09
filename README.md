@@ -3,7 +3,7 @@
 corpus is a local-first training and health data workbench. The current release is deliberately narrow and includes:
 
 - Hevy workout sessions, routines, and exercise templates imported through a read-only full snapshot;
-- local programs that group routines into ordered training days;
+- local programs that group routines into ordered training days, with optional dated training blocks;
 - a routine builder that publishes new workouts to Hevy and edits existing routines;
 - an HTML overview with session, program, routine, and exercise views;
 - workout counts, duration, weekly trends, external-load volume, muscle distribution, and exercise progress;
@@ -54,6 +54,14 @@ The web interface exposes the same sync and export actions. Sync only reads from
 Demo mode lets you preview the builder but cannot publish. Publishing requests are not automatically retried. If a request has an uncertain result, check Hevy and sync before creating again to avoid duplicates.
 
 To edit a saved routine, open **Programs → Saved routines → Edit routine**. The builder loads the current exercises and targets. Make changes and choose **Save changes to Hevy** to update that same routine. Its folder and links from Corpus programs are preserved. Sync first if you have recently changed the routine in Hevy.
+
+## Follow a training program
+
+Open **Programs → New program**, choose your routines, and set a start date and duration. Use the 8-, 10-, or 12-week shortcuts, or enter 1–52 weeks. You can also leave a program unscheduled; existing programs remain unscheduled until you edit them.
+
+Program cards show the inclusive date range, upcoming/active/completed status, current week, and sessions logged in each program week. The overview highlights active programs independently of its dashboard date filter. Time progress measures calendar days through today, not workout adherence.
+
+Sessions receive program labels when their Hevy routine ID matches a program day and their local start date falls within that block. Use the **Program** filter in Sessions to review a block. Reusing a routine outside the block does not associate those sessions; overlapping programs can both match a session. Changing a program's dates or routines recalculates associations, so keep completed blocks and create a new program for your next cycle if you want separate records. Program weeks begin on the chosen start date, while the main dashboard uses Monday-based weeks. Dates follow your laptop's local timezone.
 
 ## Configure Hevy
 

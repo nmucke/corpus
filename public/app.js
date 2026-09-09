@@ -8,7 +8,8 @@ import {
   weeklySeries,
   workoutVolume,
 } from "./analytics.js";
-import { renderPrograms as renderProgramsModule } from "./programs.js";
+import { renderPrograms as renderProgramsModule, renderProgramProgress } from "./programs.js";
+import { matchingPrograms, programTimeline } from "./program-timeline.js";
 import { renderSettings as renderSettingsModule } from "./settings.js";
 
 const root = document.querySelector("#view-root");
@@ -29,6 +30,7 @@ let period = "8";
 let selectedExerciseId = "";
 let sessionQuery = "";
 let sessionExercise = "all";
+let sessionProgram = "all";
 
 const node = (tag, className, text) => {
   const element = document.createElement(tag);
@@ -153,12 +155,49 @@ function renderOverview() {
     statCard("Weekly consistency", `${summary.consistency}%`, `${summary.activeWeeks} of ${summary.totalWeeks} weeks active`),
     statCard("Time trained", formatDuration(summary.minutes), rangeLabel),
   );
-  view.append(stats);
+  view.append(programOverview(), stats);
   const filtered = filterByPeriod(state.workouts, period, new Date());
   const grid = node("div", "dashboard-grid");
   grid.append(volumePanel(map), musclePanel(filtered, map), progressPanel(filtered, map), recentPanel(filtered, map));
   view.append(grid);
   return view;
+}
+
+function programOverview() {
+  const panel = node("section", "panel program-overview");
+  const link = node("a", "text-button", "Manage programs"); link.href = "#programs";
+  const now = new Date();
+  const active = state.programs.filter(program => programTimeline(program, now).status === "active");
+  add(panel, panelHeader(active.length ? "Currently training" : "No active program", "Program dates and activity · independent of the dashboard date range", link));
+  if (!active.length) {
+    const next = state.programs.filter(program => programTimeline(program, now).status === "upcoming").sort((a, b) => a.start_date.localeCompare(b.start_date))[0];
+    panel.append(node("p", "field-hint", next ? `Up next: ${next.title}, starting ${next.start_date}.` : "Set a program’s start date and duration in Programs to follow your training block here."));
+    return panel;
+  }
+  const grid = node("div", "program-grid");
+  for (const program of active) {
+    const card = node("article", "program-card");
+    const sessionsLink = node("a", "text-button", "View program sessions"); sessionsLink.href = "#sessions";
+    sessionsLink.addEventListener("click", () => { sessionProgram = program.id; sessionQuery = ""; sessionExercise = "all"; });
+    add(card, node("h2", "", program.title), renderProgramProgress(context(), program, now), sessionsLink);
+    grid.append(card);
+  }
+  panel.append(grid);
+  return panel;
+}
+
+function sessionProgramBadges(workout, detailed = false) {
+  const programs = matchingPrograms(workout, state.programs);
+  const badges = node("span", "program-badges");
+  for (const program of programs) {
+    const timeline = programTimeline(program, new Date(workout.start_time));
+    const badge = node("span", "program-badge", `${program.title} · week ${timeline.currentWeek}`);
+    badge.title = `Matched by routine and session date: ${timeline.startDate} – ${timeline.endDate}`;
+    badges.append(badge);
+  }
+  if (!programs.length) badges.append(node("span", "field-hint", "No program match"));
+  if (!detailed) return badges;
+  return add(node("div"), badges, node("p", "field-hint", "Program matches use the selected routines and local session dates. Changing a program’s dates or routines recalculates these matches."));
 }
 
 function panelHeader(title, subtitle, extra) {
@@ -337,6 +376,8 @@ function sessionRow(workout, map) {
   const exerciseCount = workout.exercises?.length || 0;
   const setCount = (workout.exercises || []).reduce((sum, exercise) => sum + (exercise.sets?.length || 0), 0);
   add(main, node("strong", "", workout.title || "Untitled workout"), node("span", "", `${exerciseCount} exercises · ${setCount} sets`));
+  main.append(sessionProgramBadges(workout));
+  button.setAttribute("aria-label", `${button.getAttribute("aria-label")}. ${main.lastChild.textContent}`);
   const meta = node("span", "session-meta");
   const volume = node("span"); add(volume, node("strong", "", `${formatVolume(workoutVolume(workout, map))} ${unit()}·reps`), document.createTextNode("volume"));
   const time = node("span"); add(time, node("strong", "", formatDuration(durationMinutes(workout))), document.createTextNode("duration"));
@@ -349,7 +390,7 @@ function sessionRow(workout, map) {
 function renderSessions() {
   const view = node("section", "view section-page");
   add(view, heading("Training log", "Sessions", "Search every synced workout and open a session for its full set-by-set record."));
-  const filters = node("div", "filters");
+  const filters = node("div", "filters session-filters");
   const searchField = node("div", "field search-field");
   const searchLabel = node("label", "", "Search sessions"); searchLabel.htmlFor = "session-search"; searchField.append(searchLabel);
   const search = node("input", "input"); search.id = "session-search"; search.type = "search"; search.placeholder = "Workout or exercise"; search.value = sessionQuery;
@@ -358,7 +399,15 @@ function renderSessions() {
   const select = node("select", "select"); select.id = "session-exercise"; const any = node("option", "", "All exercises"); any.value = "all"; select.append(any);
   exerciseChoices().forEach((choice) => { const option = node("option", "", choice.title); option.value = choice.id; option.selected = choice.id === sessionExercise; select.append(option); });
   select.addEventListener("change", () => { sessionExercise = select.value; updateSessionResults(results, count); }); exerciseField.append(select);
-  add(filters, searchField, exerciseField); view.append(filters);
+  const programField = node("div", "field"); const programLabel = node("label", "", "Program"); programLabel.htmlFor = "session-program";
+  const programSelect = node("select", "select"); programSelect.id = "session-program";
+  if (sessionProgram !== "all" && sessionProgram !== "none" && !state.programs.some(program => program.id === sessionProgram)) sessionProgram = "all";
+  for (const choice of [{ id: "all", title: "All programs" }, { id: "none", title: "No program match" }, ...state.programs]) {
+    const option = node("option", "", choice.title); option.value = choice.id; option.selected = choice.id === sessionProgram; programSelect.append(option);
+  }
+  programSelect.addEventListener("change", () => { sessionProgram = programSelect.value; updateSessionResults(results, count); });
+  add(programField, programLabel, programSelect);
+  add(filters, searchField, exerciseField, programField); view.append(filters);
   const count = node("p", "result-count"); const results = node("div", "panel recent-list"); add(view, count, results); updateSessionResults(results, count);
   return view;
 }
@@ -367,8 +416,10 @@ function matchingSessions() {
   const query = sessionQuery.trim().toLocaleLowerCase();
   return [...state.workouts].filter((workout) => {
     const matchesExercise = sessionExercise === "all" || (workout.exercises || []).some((exercise) => String(exercise.exercise_template_id) === sessionExercise);
+    const programs = matchingPrograms(workout, state.programs);
+    const matchesProgram = sessionProgram === "all" || (sessionProgram === "none" ? !programs.length : programs.some(program => program.id === sessionProgram));
     const haystack = [workout.title, ...(workout.exercises || []).map((exercise) => exercise.title)].filter(Boolean).join(" ").toLocaleLowerCase();
-    return matchesExercise && (!query || haystack.includes(query));
+    return matchesExercise && matchesProgram && (!query || haystack.includes(query));
   }).sort((a, b) => new Date(b.start_time) - new Date(a.start_time));
 }
 
@@ -398,7 +449,7 @@ function showSession(workout) {
   const volume = add(node("div"), node("span", "", "External volume"), node("strong", "", `${formatVolume(workoutVolume(workout, templateById()))} ${unit()}·reps`));
   const duration = add(node("div"), node("span", "", "Duration"), node("strong", "", formatDuration(durationMinutes(workout))));
   const date = add(node("div"), node("span", "", "Started"), node("strong", "", dateLabel(workout.start_time, { dateStyle: "medium", timeStyle: "short" })));
-  add(meta, date, duration, volume); content.append(meta);
+  add(meta, date, duration, volume); add(content, meta, sessionProgramBadges(workout, true));
   for (const exercise of workout.exercises || []) {
     const section = node("section", "exercise-detail"); add(section, node("h3", "", exercise.title || "Untitled exercise"));
     if (exercise.notes) section.append(node("p", "exercise-note", exercise.notes));
@@ -482,6 +533,7 @@ async function loadState() {
   if (previousMode && previousMode !== state.mode) {
     selectedExerciseId = "";
     sessionExercise = "all";
+    sessionProgram = "all";
   }
   state.workouts ||= [];
   state.routines ||= [];
