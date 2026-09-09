@@ -473,12 +473,43 @@ function renderExercises() {
   const count = node("p", "result-count"); const grid = node("div", "exercise-grid"); add(view, count, grid);
   const update = () => {
     const query = search.value.trim().toLocaleLowerCase();
-    const templates = state.exerciseTemplates.filter((item) => [item.title, item.primary_muscle_group, item.equipment].filter(Boolean).join(" ").toLocaleLowerCase().includes(query));
+    const templates = state.exerciseTemplates.filter((item) => {
+      const secondary = Array.isArray(item.secondary_muscle_groups) ? item.secondary_muscle_groups : [];
+      const searchText = [item.title, item.primary_muscle_group, ...secondary, item.equipment]
+        .filter(Boolean)
+        .join(" ")
+        .replaceAll("_", " ")
+        .toLocaleLowerCase();
+      return searchText.includes(query);
+    });
     count.textContent = `${templates.length} exercise${templates.length === 1 ? "" : "s"}`; grid.replaceChildren();
     if (!templates.length) { grid.append(emptyState("No matching exercises", "Try a broader search.", "⌕")); return; }
     templates.forEach((item) => {
-      const card = node("article", "exercise-card"); add(card, node("p", "card-kicker", String(item.type || "exercise").replaceAll("_", " ")), node("h2", "", item.title || "Untitled exercise"), node("p", "", titleCase(item.primary_muscle_group || "Other")));
-      const tags = node("div", "exercise-tags"); if (item.equipment) tags.append(node("span", "tag", String(item.equipment).replaceAll("_", " "))); (item.secondary_muscle_groups || []).forEach((muscle) => tags.append(node("span", "tag", titleCase(muscle)))); card.append(tags); grid.append(card);
+      const card = node("article", "exercise-card");
+      add(card, node("p", "card-kicker", String(item.type || "exercise").replaceAll("_", " ")), node("h2", "", item.title || "Untitled exercise"));
+
+      const secondary = Array.isArray(item.secondary_muscle_groups) ? item.secondary_muscle_groups : [];
+      const muscles = [];
+      const seenMuscles = new Set();
+      [item.primary_muscle_group, ...secondary].forEach((muscle) => {
+        const value = String(muscle || "").trim();
+        const key = value.replaceAll("_", " ").toLocaleLowerCase();
+        if (value && !seenMuscles.has(key)) { seenMuscles.add(key); muscles.push(value); }
+      });
+      const muscleTags = node("div", "exercise-tags");
+      const primaryMuscle = String(item.primary_muscle_group || "").trim();
+      (muscles.length ? muscles : ["Not specified"]).forEach((muscle) => {
+        const isPrimary = Boolean(primaryMuscle) && muscle === primaryMuscle;
+        muscleTags.append(node("span", isPrimary ? "tag primary-muscle" : "tag", `${titleCase(muscle)}${isPrimary ? " · Primary" : ""}`));
+      });
+      const muscleGroup = node("div", "exercise-attribute");
+      add(muscleGroup, node("p", "exercise-label", "Muscle groups"), muscleTags);
+
+      const equipmentTags = node("div", "exercise-tags");
+      equipmentTags.append(node("span", "tag", item.equipment ? titleCase(item.equipment) : "Not specified"));
+      const equipmentGroup = node("div", "exercise-attribute");
+      add(equipmentGroup, node("p", "exercise-label", "Equipment"), equipmentTags);
+      card.append(muscleGroup, equipmentGroup); grid.append(card);
     });
   };
   search.addEventListener("input", update); update(); return view;

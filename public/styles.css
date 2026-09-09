@@ -349,8 +349,11 @@ main { min-height: calc(100vh - 76px); }
 .routine-exercise span:last-child { color: var(--muted); text-align: right; }
 
 .exercise-card { min-height: 145px; }
+.exercise-attribute { margin-top: 13px; }
+.exercise-label { margin: 0 0 6px; color: var(--muted); font-size: 10px; font-weight: 700; letter-spacing: .04em; text-transform: uppercase; }
 .exercise-tags { display: flex; flex-wrap: wrap; gap: 6px; }
 .tag { padding: 4px 7px; border: 1px solid #dde0d7; border-radius: 99px; color: #667067; font-size: 9px; text-transform: capitalize; }
+.tag.primary-muscle { border-color: #c5d995; background: #edf5dd; color: #344d24; font-weight: 750; }
 
 .settings-layout { display: grid; grid-template-columns: minmax(0, 1fr) 290px; gap: 14px; }
 .settings-form { display: grid; gap: 20px; }
