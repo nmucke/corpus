@@ -15,10 +15,10 @@ HTML interface
 Local HTTP API  --->  Workout service  --->  SQLite database
       |                       |
       v                       v
-Markdown exports        Hevy API adapter
+Review interface         Hevy API adapter
+      ^
       |
-      v
-Codex / Claude Code workflows (planned, explicit local reads)
+Corpus MCP bridge  <---  Codex / Claude Code training session
 ```
 
 The frontend owns presentation and interaction: dashboard cards, progress charts, workout and routine views, local programs, unit preferences, demo mode, settings, sync, and export actions. The backend owns validation, persistence, sync state, atomic imports, and file permissions. The browser never talks directly to Hevy; API keys stay on the backend side of the local process.
@@ -38,8 +38,27 @@ The browser uses the following loopback-only endpoints. They are intentionally s
 | `POST` | `/api/programs` | Create or update a local program with ordered `{ label, routineId }` days and optional `start_date` / `duration_weeks`. |
 | `DELETE` | `/api/programs/:id` | Delete a local program in the active mode. |
 | `POST` | `/api/export` | Regenerate Markdown files under `data/exports/`. |
+| `GET` | `/api/session` | Issue the browser review session and CSRF token. |
+| `GET` | `/api/proposals/:id` | Read one proposal and its revision history for review. |
+| `POST` | `/api/proposals/:id/review` | Human review: accept, decline, or request a revision. |
+| `POST` | `/api/training-profile` | Save the local goals, equipment, constraints, and schedule profile. |
+| `POST` | `/api/local-routines/:id/publish` | Explicitly publish an accepted local routine to Hevy. |
 
-Static `GET` requests serve the local HTML, CSS, and JavaScript interface. Hevy writes go through the local routine endpoints, with credentials kept on the server.
+Static `GET` requests serve the local HTML, CSS, and JavaScript interface. Hevy writes go through the local routine endpoints, with credentials kept on the server. Browser review writes require the short-lived local session and CSRF token.
+
+Draft rationale, notes, descriptions, and review feedback render as Markdown through
+`public/markdown.js`, using a pinned local markdown-it browser bundle. Raw HTML
+is escaped, images render as their alternative text without loading, and links
+allow only explicit HTTP, HTTPS, or mail destinations. Draft cards show plain-text
+previews; tables and code blocks scroll within the review panel when needed.
+
+`/api/assistant/*` is separate from the browser API. It accepts a private local
+bearer credential and is used only by the bundled stdio MCP bridge. It exposes a
+fixed allowlist of context and proposal-drafting tools. It cannot review,
+publish, sync, save settings, or access files and SQL. The bridge POSTs an
+envelope shaped as `{ "args": { ... } }` to
+`/api/assistant/tools/:toolName`; no arbitrary URL, file, database, or tool name
+is accepted. See [assistant.md](assistant.md) for the complete tool contract.
 
 ## Structured storage
 
@@ -48,12 +67,17 @@ SQLite is the source of truth for the implemented workout module. The database i
 - imported Hevy workouts and their exercises and sets;
 - Hevy routines and exercise templates;
 - local programs, which group routines into ordered training days and optional dated training blocks;
+- a training profile plus proposals, immutable revision history, request ledger, and accepted local-routine overlays;
 - sync metadata and source identifiers;
 - the selected demo/live mode.
 
 Unit preference and the saved API key live in the private `data/settings.json` file.
 
-Schema version 3 adds nullable `start_date` (`YYYY-MM-DD`) and `duration_weeks` (integer 1–52) to programs. Both values must be present or both null. Existing programs migrate to unscheduled without changing their days or IDs. Updates that omit both scheduling fields preserve the saved schedule; explicitly sending both null clears it.
+Schema version 5 includes nullable `start_date` (`YYYY-MM-DD`) and
+`duration_weeks` (integer 1–52) on programs. Both values must be present or both
+null. Existing programs migrate to unscheduled without changing their days or
+IDs. Updates that omit both scheduling fields preserve the saved schedule;
+explicitly sending both null clears it.
 
 The shared `public/program-timeline.js` helpers derive inclusive end dates, statuses, and session associations. Calendar-day arithmetic avoids daylight-saving drift. A session belongs to each scheduled program with a matching routine ID and a date within the block, using the laptop's timezone. These associations are derived from the current program definition rather than persisted historical assignments. Program edits therefore recalculate them. Program weeks start on the block's start date, independently of the dashboard's Monday-based weeks. Each matching session counts once per program even if multiple days use its routine; overlapping programs may each count it. Program activity excludes future timestamps, and time progress counts calendar days through today rather than measuring adherence.
 
@@ -90,12 +114,38 @@ The analytics helpers use the workout `start_time` and local calendar weeks begi
 
 ## Local security and recovery
 
-The Hevy key can come from `HEVY_API_KEY` or local settings. Settings and any credential-bearing file should be created with owner-only permissions (`0600`) and must remain ignored by git. The key should not appear in logs, Markdown exports, test fixtures, or error messages.
+The Hevy key can come from `HEVY_API_KEY` or local settings. Settings, the
+assistant bearer credential, and other credential-bearing files are owner-only
+(`0600`) and ignored by git. Neither the Hevy key nor assistant credential is
+included in assistant tools, Markdown exports, test fixtures, or error messages.
 
-For a backup, stop the server first and copy the complete data directory, including the database, Markdown exports, sync metadata, and settings. A backup contains a credential and must be stored as sensitive local data. Restoring means replacing or selecting the complete data directory through `CORPUS_DATA_DIR`.
+For a backup, stop the server first and copy the complete data directory,
+including the database, proposals, Markdown exports, sync metadata, settings,
+and assistant credential. A backup contains credentials and personal training
+data, so store it as sensitive local data. Restoring means replacing or
+selecting the complete data directory through `CORPUS_DATA_DIR`.
 
-## AI and future modules
+## Training assistant and future modules
 
-Codex and Claude Code workflows are planned as a series of repository skills. Their safe default is to read exported Markdown and read-only SQLite queries, explain the evidence used, and save proposed programs or recommendations as reviewable notes. They should not imply local model inference, silently send data to a remote service, or mutate imported workout history. Applying a recommendation to a local program remains an explicit user action.
+The optional training assistant is a separate runtime workspace, not a developer
+agent in the repository. `scripts/assistant.js` copies `assistant/` to a
+temporary directory, starts a personal native Codex or Claude Code CLI there,
+and connects only the fixed Corpus MCP bridge. The four scoped skills cover
+analysis, routine design, program design, and proposal revision. The model sees
+compact summaries and paginated detail, rather than arbitrary database or file
+access. Its only write is saving a reviewable proposal.
+
+Proposal acceptance is local and atomic: an accepted draft can create or update
+local routine overlays and programs but does not contact Hevy. Publishing an
+accepted local routine is a later, explicit browser action. It verifies the
+imported target hash where relevant, uses a durable request identifier to avoid
+duplicate remote writes, and remaps local program days only after a successful
+new remote routine. Proposals use revisions and visible-entity hashes, so stale
+targets and competing revisions are rejected. Details are in [assistant.md](assistant.md).
+
+Corpus does not invoke an AI model or upload training data by itself. The native
+CLI selected by the user can send the compact context to its own provider under
+that account's terms. The launcher's restrictions narrow the training session;
+they are not a general operating-system isolation claim.
 
 Nutrition, supplements, body measurements, and knowledge are later modules with their own tables, importers, Markdown conventions, and provenance. They consume shared identity, time, and source conventions rather than coupling directly to the workout tables. Cloud storage, if added, requires deliberate opt-in migrations, explicit credentials, and a documented synchronization policy; it is outside the current application boundary.

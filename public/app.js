@@ -10,6 +10,7 @@ import {
 } from "./analytics.js";
 import { renderPrograms as renderProgramsModule, renderProgramProgress } from "./programs.js";
 import { matchingPrograms, programTimeline } from "./program-timeline.js";
+import { pendingCount, renderProposals } from "./proposals.js";
 import { renderSettings as renderSettingsModule } from "./settings.js";
 
 const root = document.querySelector("#view-root");
@@ -31,6 +32,8 @@ let selectedExerciseId = "";
 let sessionQuery = "";
 let sessionExercise = "all";
 let sessionProgram = "all";
+let csrfSession = null;
+let proposalPollTimer = null;
 
 const node = (tag, className, text) => {
   const element = document.createElement(tag);
@@ -44,15 +47,33 @@ const add = (parent, ...children) => {
   return parent;
 };
 
-function api(path, options = {}) {
-  return fetch(path, {
-    ...options,
-    headers: { "Content-Type": "application/json", ...(options.headers || {}) },
-  }).then(async (response) => {
-    const body = await response.json().catch(() => ({}));
-    if (!response.ok) throw Object.assign(new Error(body.error || `Request failed (${response.status})`), { code: body.code });
-    return body;
-  });
+async function csrfToken() {
+  if (!csrfSession) {
+    csrfSession = fetch("/api/session", { headers: { Accept: "application/json" } })
+      .then(async response => {
+        const body = await response.json().catch(() => ({}));
+        if (!response.ok || !body.csrfToken) throw Object.assign(new Error(body.error || "Could not start a secure session."), { code: body.code });
+        return body.csrfToken;
+      })
+      .catch(error => { csrfSession = null; throw error; });
+  }
+  return csrfSession;
+}
+
+async function api(path, options = {}, retried = false) {
+  const method = String(options.method || "GET").toUpperCase();
+  const headers = { "Content-Type": "application/json", ...(options.headers || {}) };
+  if (!['GET', 'HEAD', 'OPTIONS'].includes(method)) headers["X-Corpus-CSRF"] = await csrfToken();
+  const response = await fetch(path, { ...options, headers });
+  const body = await response.json().catch(() => ({}));
+  // The server rejects an invalid token before it runs a mutation, so one
+  // fresh-session retry is safe and avoids duplicating a completed request.
+  if (!response.ok && response.status === 403 && body.code === "csrf_invalid" && !retried) {
+    csrfSession = null;
+    return api(path, options, true);
+  }
+  if (!response.ok) throw Object.assign(new Error(body.error || `Request failed (${response.status})`), { code: body.code });
+  return body;
 }
 
 function toast(title, message = "", type = "success") {
@@ -95,7 +116,7 @@ function dateLabel(value, options = { month: "short", day: "numeric" }) {
 }
 function route() {
   const value = location.hash.slice(1).split("/")[0];
-  return ["overview", "sessions", "programs", "exercises", "settings"].includes(value) ? value : "overview";
+  return ["overview", "sessions", "programs", "proposals", "exercises", "settings"].includes(value) ? value : "overview";
 }
 
 function heading(eyebrow, title, description, action) {
@@ -539,6 +560,20 @@ function updateChrome() {
   syncButton.disabled = false;
   syncButton.title = state.settings.hasApiKey ? "Sync your Hevy archive" : "Add your Hevy API key in Settings to sync";
   document.querySelectorAll("[data-route]").forEach((link) => link.classList.toggle("is-active", link.dataset.route === route()));
+  const badge = document.querySelector("#proposals-badge");
+  const count = pendingCount(state.proposals || []);
+  if (badge) { badge.textContent = count ? String(count) : ""; badge.hidden = !count; }
+}
+
+function syncProposalPolling() {
+  const focused = typeof document.hasFocus !== "function" || document.hasFocus();
+  const active = route() === "proposals" && (document.visibilityState !== "hidden" || focused);
+  if (active && !proposalPollTimer) proposalPollTimer = window.setInterval(() => {
+    const currentProfile = document.querySelector(".proposals-view .profile-form");
+    if (currentProfile && (currentProfile.dataset.dirty === "true" || currentProfile.contains(document.activeElement))) return;
+    loadState().catch(() => {});
+  }, 15000);
+  if (!active && proposalPollTimer) { window.clearInterval(proposalPollTimer); proposalPollTimer = null; }
 }
 
 function render() {
@@ -548,6 +583,7 @@ function render() {
   switch (route()) {
     case "sessions": view = renderSessions(); break;
     case "programs": view = renderProgramsModule(context()); break;
+    case "proposals": view = renderProposals(context()); break;
     case "exercises": view = renderExercises(); break;
     case "settings": view = renderSettingsModule(context()); break;
     default: view = renderOverview();
@@ -556,6 +592,7 @@ function render() {
   root.hidden = false;
   loading.hidden = true;
   closeMenu();
+  syncProposalPolling();
 }
 
 async function loadState() {
@@ -570,6 +607,8 @@ async function loadState() {
   state.routines ||= [];
   state.exerciseTemplates ||= [];
   state.programs ||= [];
+  state.proposals ||= [];
+  state.trainingProfile ||= { goals: "", equipment: "", constraints: "", schedule: "" };
   state.settings ||= { unit: "kg", hasApiKey: false, lastSync: null };
   render();
   return state;
@@ -589,6 +628,8 @@ menuButton.addEventListener("click", () => {
 });
 scrim.addEventListener("click", closeMenu);
 window.addEventListener("hashchange", render);
+window.addEventListener("focus", syncProposalPolling);
+document.addEventListener("visibilitychange", syncProposalPolling);
 document.querySelector(".dialog-close").addEventListener("click", () => dialog.close());
 dialog.addEventListener("click", (event) => { if (event.target === dialog) dialog.close(); });
 

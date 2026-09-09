@@ -11,6 +11,8 @@
     "test": "node --test",
     "sync": "node server/cli.js sync",
     "export": "node server/cli.js export",
-    "status": "node server/cli.js status"
+    "status": "node server/cli.js status",
+    "assistant:codex": "node scripts/assistant.js codex",
+    "assistant:claude": "node scripts/assistant.js claude"
   }
 }

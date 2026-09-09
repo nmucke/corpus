@@ -78,7 +78,7 @@ export function renderPrograms(ctx) {
   view.append(grid);
   view.append(node('p', 'field-hint', 'Matches are based on selected routines and session dates. Editing dates or routines recalculates them.'));
   const routineHeading = node('header', 'panel-header'); routineHeading.style.marginTop = '36px';
-  add(routineHeading, add(node('div'), node('h2', '', 'Saved routines'), node('p', '', 'Imported from Hevy · expand a routine to see the prescribed sets.')));
+  add(routineHeading, add(node('div'), node('h2', '', 'Saved routines'), node('p', '', 'Hevy routines and accepted local drafts · expand to see the prescribed sets.')));
   routineHeading.append(button('+ New Hevy routine', () => openRoutineBuilder(ctx), 'button primary')); view.append(routineHeading);
   const routineGrid = node('div', 'routine-grid');
   for (const routine of state.routines) {
@@ -109,8 +109,30 @@ export function renderPrograms(ctx) {
       section.append(list); content.append(section);
     }
     details.append(content); const actions = node('div', 'dialog-actions card-actions'); add(actions,
-      button('Muscle coverage', () => openMuscleCoverage(ctx, { routine }), 'button secondary'),
-      button('Edit routine', () => openRoutineBuilder(ctx, routine), 'button secondary'));
+      button('Muscle coverage', () => openMuscleCoverage(ctx, { routine }), 'button secondary'));
+    if (routine.source === 'local') {
+      const publish = button('Publish to Hevy', async () => {
+        if (publish.disabled) return;
+        publish.disabled = true;
+        try {
+          const result = await api(`/api/local-routines/${encodeURIComponent(routine.id)}/publish`, { method: 'POST', body: '{}' });
+          await refresh();
+          toast('Routine published to Hevy', result.warning || 'Your routine is available in Hevy.');
+        } catch (error) {
+          toast('Could not publish routine', error.message, 'error');
+          publish.disabled = false;
+        }
+      }, 'button primary');
+      publish.disabled = state.mode === 'demo';
+      publish.title = state.mode === 'demo' ? 'Publishing is unavailable in demo mode.' : 'Publish this accepted local routine to Hevy';
+      add(actions, publish, button('Request AI changes', () => {
+        location.hash = '#proposals';
+        toast('Ask your training assistant', `Ask Claude or Codex to propose changes to “${routine.title}”. The new draft will appear here for review.`);
+      }, 'button secondary'));
+      actions.append(node('p', 'field-hint', 'Accepted locally · request AI changes from the drafts workspace.'));
+    } else {
+      actions.append(button('Edit routine', () => openRoutineBuilder(ctx, routine), 'button secondary'));
+    }
     card.append(details, actions); routineGrid.append(card);
   }
   if (!state.routines.length) routineGrid.append(add(node('div', 'panel'), node('h3', '', 'No routines yet'), node('p', '', 'Connect Hevy in Settings, then sync to import your saved workouts.')));

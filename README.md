@@ -8,6 +8,7 @@ corpus is a local-first training and health data workbench. The current release 
 - an HTML overview with session, program, routine, and exercise views;
 - workout counts, duration, weekly trends, external-load volume, muscle distribution, and exercise progress;
 - a separate synthetic demo mode, kg/lb preferences, local settings, and Markdown export.
+- an optional, tools-only training assistant that prepares local proposals for review.
 
 Future modules can add supplements, nutrition, body measurements, and a knowledge library without changing the local-only boundary.
 
@@ -41,6 +42,47 @@ npm run status    # print the local mode and record counts
 npm run sync      # manually import a read-only full Hevy snapshot
 npm run export    # generate Markdown exports for analysis
 ```
+
+## Use the training assistant
+
+The training assistant is a separate role from development. It reads compact,
+bounded Corpus context through its local MCP server and can save a proposal. It
+cannot sync, change settings, edit code, run SQL, approve a proposal, or publish
+to Hevy. Review and publishing stay in the Corpus interface.
+
+Start Corpus first, then launch one personal CLI from a terminal in this
+repository:
+
+```sh
+npm run assistant:codex
+npm run assistant:claude
+
+# verify the installed CLI supports the restricted launch without starting a session
+npm run assistant:codex -- --check
+npm run assistant:claude -- --check
+```
+
+Install and sign in to the native CLI before running either command. Codex can
+use a ChatGPT subscription or an API key; this launcher requires the ChatGPT
+sign-in path. OpenAI documents installation, sign-in, and billing in its
+[Codex CLI guide](https://learn.chatgpt.com/docs/codex/cli),
+[authentication guide](https://learn.chatgpt.com/docs/auth), and
+[pricing guide](https://learn.chatgpt.com/docs/pricing). Claude Code supports a
+personal subscription or Console account; see its
+[quickstart](https://code.claude.com/docs/en/quickstart) and
+[authentication guide](https://code.claude.com/docs/en/authentication).
+
+The launcher copies only `assistant/` into a temporary workspace. It keeps the
+CLI's normal personal login location and does not edit global configuration.
+For Codex it requires ChatGPT authentication, read-only sandboxing, the Corpus
+MCP server, and no shell or other MCP tools. For Claude it starts with only
+`Skill`, `AskUserQuestion`, and the strict Corpus MCP configuration. These are
+launch restrictions for the training session, not a general-purpose operating
+system security boundary. In VS Code, open the integrated terminal and run the
+same commands; Corpus does not configure an IDE extension automatically.
+
+See [docs/assistant.md](docs/assistant.md) for the skills, proposal workflow,
+privacy boundary, and MCP contract.
 
 The web interface exposes the same sync and export actions. Sync only reads from Hevy. **Create in Hevy** publishes a new routine; **Save changes to Hevy** updates the routine being edited. Workout history is not changed by either action.
 
@@ -77,12 +119,17 @@ The first sync imports a complete paginated snapshot of workouts, routines, and 
 
 ## Local data
 
-The default data directory is `data/`, which is ignored by git. It contains `data/corpus.sqlite`, the SQLite database for structured records and sync metadata; generated Markdown under `data/exports/`; and the credential-bearing `data/settings.json`. Current Hevy workout, routine, and exercise-template table IDs are the corresponding Hevy IDs. Future connectors will need a deliberate namespaced-ID migration before adding other sources. A `data/knowledge/` convention may be introduced with the later knowledge module; it is not part of the current data model.
+The default data directory is `data/`, which is ignored by git. It contains `data/corpus.sqlite`, the SQLite database for structured records, proposals, and sync metadata; generated Markdown under `data/exports/`; the credential-bearing `data/settings.json`; the local assistant credential; and proposal rationale files. Current Hevy workout, routine, and exercise-template table IDs are the corresponding Hevy IDs. Future connectors will need a deliberate namespaced-ID migration before adding other sources. A `data/knowledge/` convention may be introduced with the later knowledge module; it is not part of the current data model.
 
 To make a backup, stop corpus and copy the entire data directory to a protected location. The copy includes the local credential and should be treated as sensitive.
 
 ## Project direction
 
-The local database remains the source of truth for the current workout data. Markdown exports are the readable boundary for Codex and Claude Code workflows. Planned AI skills may read exported Markdown and read-only SQL queries against `data/corpus.sqlite`, then write recommendations as reviewable notes; the current application does not perform AI inference or send personal data to a remote model automatically.
+The local database remains the source of truth for current workout data. The
+optional assistant uses the fixed, local MCP tool set described in
+[docs/assistant.md](docs/assistant.md), rather than exports, arbitrary file
+access, or SQL. Corpus itself makes no AI-provider request. A chosen native CLI
+may send the bounded context it receives to that CLI's provider; the launcher
+states this before it starts a session.
 
 The architecture is documented in [docs/architecture.md](docs/architecture.md). It keeps workouts, nutrition, supplements, and knowledge as separate modules so each can be added one at a time. Cloud storage can be added later only through an explicit opt-in migration with a clear data contract; it is not promised by the current local setup.

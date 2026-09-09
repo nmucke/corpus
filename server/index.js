@@ -3,6 +3,8 @@ import { readFile } from 'node:fs/promises';
 import { dirname, resolve, extname, sep } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { createService } from './service.js';
+import { callAssistantTool } from './assistant-tools.js';
+import { browserSessions, equalToken, loadAssistantToken } from './assistant-access.js';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const publicDir = resolve(root, 'public');
@@ -13,7 +15,7 @@ function json(res, status, value) {
   res.end(JSON.stringify(value));
 }
 
-async function body(req) {
+async function body(req, maximum = 65536) {
   if (!/^application\/json(?:\s*;|$)/i.test(req.headers['content-type'] || '')) {
     throw Object.assign(new Error('Use application/json for this request.'), { status: 415 });
   }
@@ -21,7 +23,7 @@ async function body(req) {
   const chunks = [];
   for await (const chunk of req) {
     size += chunk.length;
-    if (size > 65536) throw Object.assign(new Error('Request is too large.'), { status: 413 });
+    if (size > maximum) throw Object.assign(new Error('Request is too large.'), { status: 413 });
     chunks.push(chunk);
   }
   try {
@@ -33,7 +35,8 @@ async function body(req) {
   }
 }
 
-export function createApp(service) {
+export function createApp(service, { assistantToken = null } = {}) {
+  const sessions = browserSessions();
   return http.createServer(async (req, res) => {
     res.setHeader('X-Content-Type-Options', 'nosniff');
     res.setHeader('Referrer-Policy', 'no-referrer');
@@ -47,6 +50,31 @@ export function createApp(service) {
     try {
       const url = new URL(req.url, `http://${req.headers.host}`);
       const path = url.pathname;
+      if (path.startsWith('/api/assistant/')) {
+        const token = req.headers.authorization?.match(/^Bearer ([^\s]+)$/)?.[1];
+        if (!equalToken(token, assistantToken)) return json(res, 401, { error: 'A valid Corpus assistant credential is required.', code: 'assistant_unauthorized' });
+        if (path === '/api/assistant/status' && req.method === 'GET') return json(res, 200, { ok: true, mode: service.getState().mode });
+        const match = path.match(/^\/api\/assistant\/tools\/([a-z_]+)$/);
+        if (req.method !== 'POST' || !match) return json(res, 404, { error: 'Assistant tool not found.' });
+        const envelope = await body(req, 262144);
+        if (Object.keys(envelope).length !== 1 || !Object.hasOwn(envelope, 'args') || !envelope.args || typeof envelope.args !== 'object' || Array.isArray(envelope.args)) {
+          throw Object.assign(new Error('Assistant requests must contain an args object.'), { status: 400, code: 'assistant_envelope' });
+        }
+        return json(res, 200, await callAssistantTool(service, match[1], envelope.args));
+      }
+      if (req.headers.authorization) return json(res, 403, { error: 'Assistant credentials cannot access the review interface.', code: 'assistant_forbidden' });
+      if (req.method === 'GET' && path === '/api/session') return json(res, 200, sessions.issue(req, res));
+      if (req.method === 'GET' && /^\/api\/proposals\/[^/]+$/.test(path)) return json(res, 200, await service.getProposal(decodeURIComponent(path.split('/').at(-1))));
+      const review = path.match(/^\/api\/proposals\/([^/]+)\/review$/);
+      const publishLocal = path.match(/^\/api\/local-routines\/([^/]+)\/publish$/);
+      if (req.method === 'POST' && (review || publishLocal || path === '/api/training-profile')) {
+        if (!sessions.verify(req)) return json(res, 403, { error: 'Refresh the review session and try again.', code: 'csrf_invalid' });
+        const payload = await body(req);
+        const result = review ? await service.reviewProposal(decodeURIComponent(review[1]), payload)
+          : publishLocal ? await service.publishLocalRoutine(decodeURIComponent(publishLocal[1]), payload)
+            : await service.saveTrainingProfile(payload);
+        return json(res, 200, result);
+      }
       if (req.method === 'GET' && path === '/api/state') return json(res, 200, await service.getState());
       if (req.method === 'POST') {
         const payload = await body(req);
@@ -90,8 +118,9 @@ export function createApp(service) {
 async function main() {
   const port = Number(process.env.PORT || 3210);
   if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error('PORT must be an integer from 1 to 65535.');
-  const service = await createService({ dataDir: resolve(process.env.CORPUS_DATA_DIR || resolve(root, 'data')) });
-  const server = createApp(service);
+  const dataDir = resolve(process.env.CORPUS_DATA_DIR || resolve(root, 'data'));
+  const service = await createService({ dataDir });
+  const server = createApp(service, { assistantToken: await loadAssistantToken(dataDir) });
   server.on('error', (error) => {
     console.error(error.code === 'EADDRINUSE' ? `Port ${port} is already in use. Try PORT=3211 npm start.` : 'Corpus could not start its local server.');
     service.close();

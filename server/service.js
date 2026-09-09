@@ -5,8 +5,11 @@ import { createHash, randomUUID } from 'node:crypto';
 import { demoState } from './demo.js';
 import { fetchSnapshot, postRoutine, updateRoutine as putRoutine, ROUTINE_UNCERTAIN_MESSAGE, ROUTINE_UPDATE_UNCERTAIN_MESSAGE } from './hevy.js';
 import { programTimeline, validateProgramSchedule } from '../public/program-timeline.js';
+import { entityHash, proposalDraft, publicProposal } from './proposals.js';
 
-const SCHEMA_VERSION = 3;
+export { entityHash } from './proposals.js';
+
+const SCHEMA_VERSION = 5;
 const PROGRAM_TITLE_MAX = 160;
 const PROGRAM_DESCRIPTION_MAX = 4000;
 
@@ -63,14 +66,22 @@ function initialise(db) {
     CREATE TABLE IF NOT EXISTS routine_sets (routine_id TEXT NOT NULL, exercise_index INTEGER NOT NULL, set_index INTEGER NOT NULL, set_type TEXT, rep_range TEXT, raw_json TEXT NOT NULL, PRIMARY KEY(routine_id, exercise_index, set_index), FOREIGN KEY(routine_id, exercise_index) REFERENCES routine_exercises(routine_id, exercise_index) ON DELETE CASCADE);
     CREATE TABLE IF NOT EXISTS exercise_templates (id TEXT PRIMARY KEY, title TEXT, raw_json TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS programs (id TEXT PRIMARY KEY, mode TEXT NOT NULL, title TEXT NOT NULL, description TEXT NOT NULL, days_json TEXT NOT NULL, start_date TEXT, duration_weeks INTEGER, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
-    CREATE TABLE IF NOT EXISTS routine_publications (request_id TEXT PRIMARY KEY, payload_hash TEXT NOT NULL, status TEXT NOT NULL CHECK(status IN ('pending', 'succeeded', 'uncertain')), result_json TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);`);
+    CREATE TABLE IF NOT EXISTS routine_publications (request_id TEXT PRIMARY KEY, payload_hash TEXT NOT NULL, status TEXT NOT NULL CHECK(status IN ('pending', 'succeeded', 'uncertain')), result_json TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS local_routines (id TEXT PRIMARY KEY, mode TEXT NOT NULL, hevy_id TEXT, base_hash TEXT, raw_json TEXT NOT NULL, proposal_id TEXT NOT NULL, publish_request_id TEXT, publish_status TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS local_routine_mappings (local_id TEXT PRIMARY KEY, remote_id TEXT NOT NULL, result_json TEXT, created_at TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS proposals (id TEXT PRIMARY KEY, revision INTEGER NOT NULL, mode TEXT NOT NULL, status TEXT NOT NULL CHECK(status IN ('draft','revision_requested','accepted','declined')), title TEXT NOT NULL, rationale TEXT NOT NULL, routines_json TEXT NOT NULL, programs_json TEXT NOT NULL, feedback TEXT, result_json TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS proposal_history (proposal_id TEXT NOT NULL REFERENCES proposals(id) ON DELETE CASCADE, revision INTEGER NOT NULL, status TEXT NOT NULL, title TEXT NOT NULL, rationale TEXT NOT NULL, routines_json TEXT NOT NULL, programs_json TEXT NOT NULL, feedback TEXT, result_json TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, PRIMARY KEY(proposal_id, revision));
+    CREATE TABLE IF NOT EXISTS proposal_requests (request_id TEXT PRIMARY KEY, payload_hash TEXT NOT NULL, proposal_id TEXT NOT NULL REFERENCES proposals(id) ON DELETE CASCADE, revision INTEGER NOT NULL, created_at TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS training_profiles (mode TEXT PRIMARY KEY, goals TEXT NOT NULL, equipment TEXT NOT NULL, constraints TEXT NOT NULL, schedule TEXT NOT NULL, updated_at TEXT NOT NULL);`);
   const programColumns = new Set(db.prepare('PRAGMA table_info(programs)').all().map((column) => column.name));
-  const needsMigration = !version || Number(version) < SCHEMA_VERSION || !programColumns.has('start_date') || !programColumns.has('duration_weeks');
+  const mappingColumns = new Set(db.prepare('PRAGMA table_info(local_routine_mappings)').all().map((column) => column.name));
+  const needsMigration = !version || Number(version) < SCHEMA_VERSION || !programColumns.has('start_date') || !programColumns.has('duration_weeks') || !mappingColumns.has('result_json');
   if (needsMigration) {
     try {
       db.exec('BEGIN IMMEDIATE');
       if (!programColumns.has('start_date')) db.exec('ALTER TABLE programs ADD COLUMN start_date TEXT');
       if (!programColumns.has('duration_weeks')) db.exec('ALTER TABLE programs ADD COLUMN duration_weeks INTEGER');
+      if (!mappingColumns.has('result_json')) db.exec('ALTER TABLE local_routine_mappings ADD COLUMN result_json TEXT');
       if (!version) db.prepare('INSERT INTO meta(key, value) VALUES (?, ?)').run('schema_version', String(SCHEMA_VERSION));
       else db.prepare('UPDATE meta SET value = ? WHERE key = ?').run(String(SCHEMA_VERSION), 'schema_version');
       db.exec('COMMIT');
@@ -360,12 +371,24 @@ export async function createService({ dataDir, fetchImpl = globalThis.fetch } = 
   const mode = () => getMeta('mode') === 'live' ? 'live' : 'demo';
   const publicSettings = () => ({ unit: privateSettings.unit === 'lb' ? 'lb' : 'kg', hasApiKey: Boolean(activeKey()), lastSync: getMeta('last_sync') });
   const programs = (currentMode) => db.prepare('SELECT id, title, description, days_json, start_date, duration_weeks, created_at, updated_at FROM programs WHERE mode = ? ORDER BY created_at').all(currentMode).map(({ days_json, ...program }) => ({ ...program, days: parse(days_json) }));
+  const visibleRoutines = (currentMode) => {
+    const base = currentMode === 'demo' ? demoState().routines : db.prepare('SELECT raw_json FROM routines ORDER BY title, id').all().map((row) => parse(row.raw_json));
+    const overlays = db.prepare('SELECT id, raw_json FROM local_routines WHERE mode = ? ORDER BY created_at').all(currentMode);
+    const byId = new Map(base.map((routine) => [routine.id, routine]));
+    for (const row of overlays) byId.set(row.id, parse(row.raw_json));
+    return [...byId.values()];
+  };
+  const trainingProfile = (currentMode) => {
+    const row = db.prepare('SELECT goals, equipment, constraints, schedule, updated_at FROM training_profiles WHERE mode = ?').get(currentMode);
+    return row ?? { goals: '', equipment: '', constraints: '', schedule: '', updated_at: null };
+  };
+  const proposalRows = (currentMode) => db.prepare('SELECT * FROM proposals WHERE mode = ? ORDER BY updated_at DESC').all(currentMode).map((row) => publicProposal(row));
   const state = () => {
     const currentMode = mode();
     const data = currentMode === 'demo'
       ? demoState()
       : { workouts: db.prepare('SELECT raw_json FROM workouts ORDER BY start_time DESC, id').all().map((row) => parse(row.raw_json)), routines: db.prepare('SELECT raw_json FROM routines ORDER BY title, id').all().map((row) => parse(row.raw_json)), exerciseTemplates: db.prepare('SELECT raw_json FROM exercise_templates ORDER BY title, id').all().map((row) => parse(row.raw_json)) };
-    return { mode: currentMode, settings: publicSettings(), ...data, programs: programs(currentMode) };
+    return { mode: currentMode, settings: publicSettings(), ...data, routines: visibleRoutines(currentMode), programs: programs(currentMode), proposals: proposalRows(currentMode), trainingProfile: trainingProfile(currentMode) };
   };
 
   return {
@@ -404,6 +427,118 @@ export async function createService({ dataDir, fetchImpl = globalThis.fetch } = 
         return state();
       });
       try { return await syncPromise; } finally { syncPromise = null; }
+    },
+    async submitProposal(body = {}) {
+      return serialiseWrite(async () => {
+        const currentMode = mode();
+        if (!body || typeof body !== 'object' || Array.isArray(body) || !uuid(body.requestId)) throw new ServiceError('validation', 'requestId must be a UUID.');
+        const hash = payloadHash(body);
+        const request = db.prepare('SELECT r.payload_hash, r.proposal_id, r.revision, p.mode AS proposal_mode FROM proposal_requests r JOIN proposals p ON p.id = r.proposal_id WHERE r.request_id = ?').get(body.requestId);
+        if (request) {
+          if (request.proposal_mode !== currentMode) throw new ServiceError('request_conflict', 'This request id belongs to a proposal in another data mode.', 409);
+          if (request.payload_hash !== hash) throw new ServiceError('request_conflict', 'This request id was already used for a different proposal.', 409);
+          const saved = db.prepare('SELECT proposal_id AS id, revision, status, title, rationale, routines_json, programs_json, feedback, result_json, created_at, updated_at FROM proposal_history WHERE proposal_id = ? AND revision = ?').get(request.proposal_id, request.revision);
+          return publicProposal(saved);
+        }
+        const visible = visibleRoutines(currentMode);
+        const templates = currentMode === 'demo'
+          ? demoState().exerciseTemplates
+          : db.prepare('SELECT id, title FROM exercise_templates').all();
+        const templateIds = new Set(templates.map((template) => template.id));
+        const templateTitles = new Map(templates.map((template) => [template.id, template.title]));
+        const fail = (code, message, status = 400) => { throw new ServiceError(code, message, status); };
+        const draft = proposalDraft(body, { routines: visible, programs: programs(currentMode), templateIds, templateTitles, buildRoutine: buildRoutinePayload, fail });
+        const now = isoNow(); let id; let revision; let created;
+        try {
+          db.exec('BEGIN IMMEDIATE');
+          if (draft.id) {
+            const previous = db.prepare('SELECT * FROM proposals WHERE id = ? AND mode = ?').get(draft.id, currentMode);
+            if (!previous) throw new ServiceError('not_found', 'Proposal was not found.', 404);
+            if (previous.status !== 'revision_requested') throw new ServiceError('proposal_immutable', 'Only a requested revision can replace a proposal.', 409);
+            if (draft.expectedRevision !== previous.revision) throw new ServiceError('revision_conflict', 'This proposal has a newer revision.', 409);
+            id = previous.id; revision = previous.revision + 1; created = previous.created_at;
+            db.prepare('UPDATE proposals SET revision=?, status=?, title=?, rationale=?, routines_json=?, programs_json=?, feedback=NULL, result_json=NULL, updated_at=? WHERE id=?').run(revision, 'draft', draft.title, draft.rationale, json(draft.routines), json(draft.programs), now, id);
+          } else {
+            if (draft.expectedRevision !== undefined) throw new ServiceError('validation', 'expectedRevision requires a proposal id.');
+            id = randomUUID(); revision = 1; created = now;
+            db.prepare('INSERT INTO proposals(id, revision, mode, status, title, rationale, routines_json, programs_json, feedback, result_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').run(id, revision, currentMode, 'draft', draft.title, draft.rationale, json(draft.routines), json(draft.programs), null, null, created, now);
+          }
+          db.prepare('INSERT INTO proposal_history(proposal_id, revision, status, title, rationale, routines_json, programs_json, feedback, result_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').run(id, revision, 'draft', draft.title, draft.rationale, json(draft.routines), json(draft.programs), null, null, created, now);
+          db.prepare('INSERT INTO proposal_requests(request_id, payload_hash, proposal_id, revision, created_at) VALUES (?, ?, ?, ?, ?)').run(draft.requestId, hash, id, revision, now);
+          db.exec('COMMIT');
+        } catch (error) { try { db.exec('ROLLBACK'); } catch {} throw error; }
+        const proposalDir = path.join(dataDir, 'proposals', id);
+        await mkdir(proposalDir, { recursive: true, mode: 0o700 });
+        await writeFile(path.join(proposalDir, `revision-${revision}.md`), `${draft.rationale}\n`, { mode: 0o600 });
+        return publicProposal(db.prepare('SELECT * FROM proposals WHERE id = ?').get(id));
+      });
+    },
+    getProposal(id) {
+      if (!uuid(id)) throw new ServiceError('validation', 'Proposal id is invalid.');
+      const row = db.prepare('SELECT * FROM proposals WHERE id = ? AND mode = ?').get(id, mode());
+      if (!row) throw new ServiceError('not_found', 'Proposal was not found.', 404);
+      const history = db.prepare('SELECT proposal_id AS id, revision, status, title, rationale, routines_json, programs_json, feedback, result_json, created_at, updated_at FROM proposal_history WHERE proposal_id = ? ORDER BY revision').all(id).map((entry) => publicProposal(entry));
+      return publicProposal(row, history);
+    },
+    async reviewProposal(id, body = {}) {
+      return serialiseWrite(async () => {
+        if (!uuid(id)) throw new ServiceError('validation', 'Proposal id is invalid.');
+        if (!body || typeof body !== 'object' || Array.isArray(body) || Object.keys(body).some((key) => !['action', 'expectedRevision', 'feedback'].includes(key))) throw new ServiceError('validation', 'Review contains an unsupported field.');
+        if (!['accept', 'decline', 'request_revision'].includes(body.action)) throw new ServiceError('validation', 'Review action is invalid.');
+        if (!Number.isInteger(body.expectedRevision) || body.expectedRevision < 1) throw new ServiceError('validation', 'expectedRevision must be a positive integer.');
+        const feedback = body.feedback === undefined ? null : cleanText(body.feedback, 4000, 'Feedback');
+        const currentMode = mode(); const proposal = db.prepare('SELECT * FROM proposals WHERE id = ? AND mode = ?').get(id, currentMode);
+        if (!proposal) throw new ServiceError('not_found', 'Proposal was not found.', 404);
+        if (proposal.revision !== body.expectedRevision) throw new ServiceError('revision_conflict', 'This proposal has a newer revision.', 409);
+        if (proposal.status !== 'draft') throw new ServiceError('proposal_immutable', 'Only a draft proposal can be reviewed.', 409);
+        const now = isoNow(); let result = null; let status = body.action === 'accept' ? 'accepted' : body.action === 'decline' ? 'declined' : 'revision_requested';
+        try {
+          db.exec('BEGIN IMMEDIATE');
+          if (body.action === 'accept') {
+            const currentRoutines = visibleRoutines(currentMode); const currentPrograms = programs(currentMode);
+            const draftedRoutines = parse(proposal.routines_json); const draftedPrograms = parse(proposal.programs_json);
+            for (const entry of draftedRoutines) if (entry.targetId && (!currentRoutines.find((value) => value.id === entry.targetId) || entityHash(currentRoutines.find((value) => value.id === entry.targetId)) !== entry.baseHash)) throw new ServiceError('stale_target', 'A routine changed since this proposal was drafted.', 409);
+            for (const entry of draftedPrograms) if (entry.targetId && (!currentPrograms.find((value) => value.id === entry.targetId) || entityHash(currentPrograms.find((value) => value.id === entry.targetId)) !== entry.baseHash)) throw new ServiceError('stale_target', 'A program changed since this proposal was drafted.', 409);
+            const routineIds = {}; const programIds = {};
+            for (const entry of draftedRoutines) {
+              const existingOverlay = entry.targetId ? db.prepare('SELECT hevy_id, base_hash, created_at, publish_status FROM local_routines WHERE id = ? AND mode = ?').get(entry.targetId, currentMode) : null;
+              if (existingOverlay?.publish_status === 'pending') throw new ServiceError('publication_pending', 'This routine is being published. Wait before accepting another edit.', 409);
+              if (existingOverlay?.publish_status === 'uncertain') throw new ServiceError('publication_uncertain', 'This routine publication is uncertain. Check Hevy before accepting another edit.', 502);
+              const idForRoutine = entry.targetId ?? `local-${randomUUID()}`;
+              const imported = entry.targetId && currentMode === 'live' ? db.prepare('SELECT raw_json FROM routines WHERE id = ?').get(entry.targetId) : null;
+              const after = { ...entry.after, id: idForRoutine, source: 'local', hevy_id: existingOverlay ? existingOverlay.hevy_id : (imported ? entry.targetId : null) };
+              db.prepare('INSERT INTO local_routines(id, mode, hevy_id, base_hash, raw_json, proposal_id, publish_request_id, publish_status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET hevy_id=excluded.hevy_id, base_hash=excluded.base_hash, raw_json=excluded.raw_json, proposal_id=excluded.proposal_id, updated_at=excluded.updated_at').run(idForRoutine, currentMode, after.hevy_id, existingOverlay?.base_hash ?? (imported ? entityHash(parse(imported.raw_json)) : null), json(after), proposal.id, null, null, existingOverlay?.created_at ?? now, now);
+              // An edited Hevy routine keeps its remote id as the local overlay
+              // id. A prior publication mapping for that id belongs to an older
+              // edit and must not short-circuit this newly accepted change.
+              if (entry.targetId) db.prepare('DELETE FROM local_routine_mappings WHERE local_id = ?').run(idForRoutine);
+              routineIds[entry.key] = idForRoutine;
+            }
+            const available = new Set([...currentRoutines.map((routine) => routine.id), ...Object.values(routineIds)]);
+            for (const entry of draftedPrograms) {
+              const days = entry.after.days.map((day) => ({ label: day.label, routineId: day.routineKey ? routineIds[day.routineKey] : day.routineId }));
+              if (days.some((day) => !available.has(day.routineId))) throw new ServiceError('validation', 'A proposed program refers to an unavailable routine.');
+              const existing = entry.targetId ? db.prepare('SELECT id, created_at FROM programs WHERE id = ? AND mode = ?').get(entry.targetId, currentMode) : null;
+              const programId = existing?.id ?? randomUUID(); const created = existing?.created_at ?? now;
+              db.prepare('INSERT INTO programs(id, mode, title, description, days_json, start_date, duration_weeks, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET title=excluded.title, description=excluded.description, days_json=excluded.days_json, start_date=excluded.start_date, duration_weeks=excluded.duration_weeks, updated_at=excluded.updated_at').run(programId, currentMode, entry.after.title, entry.after.description, json(days), entry.after.start_date, entry.after.duration_weeks, created, now);
+              programIds[entry.key] = programId;
+            }
+            result = { routineIds, programIds };
+          }
+          db.prepare('UPDATE proposals SET status=?, feedback=?, result_json=?, updated_at=? WHERE id=?').run(status, feedback, result ? json(result) : null, now, id);
+          db.prepare('UPDATE proposal_history SET status=?, feedback=?, result_json=?, updated_at=? WHERE proposal_id=? AND revision=?').run(status, feedback, result ? json(result) : null, now, id, proposal.revision);
+          db.exec('COMMIT');
+        } catch (error) { try { db.exec('ROLLBACK'); } catch {} throw error; }
+        return publicProposal(db.prepare('SELECT * FROM proposals WHERE id = ?').get(id));
+      });
+    },
+    async saveTrainingProfile(body = {}) {
+      return serialiseWrite(async () => {
+        if (!body || typeof body !== 'object' || Array.isArray(body) || Object.keys(body).some((key) => !['goals', 'equipment', 'constraints', 'schedule'].includes(key))) throw new ServiceError('validation', 'Training profile contains an unsupported field.');
+        const goals = cleanText(body.goals, 4000, 'Goals'); const equipment = cleanText(body.equipment, 4000, 'Equipment'); const constraints = cleanText(body.constraints, 4000, 'Constraints'); const schedule = cleanText(body.schedule, 4000, 'Schedule'); const updated_at = isoNow(); const currentMode = mode();
+        db.prepare('INSERT INTO training_profiles(mode, goals, equipment, constraints, schedule, updated_at) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(mode) DO UPDATE SET goals=excluded.goals,equipment=excluded.equipment,constraints=excluded.constraints,schedule=excluded.schedule,updated_at=excluded.updated_at').run(currentMode, goals, equipment, constraints, schedule, updated_at);
+        return { goals, equipment, constraints, schedule, updated_at };
+      });
     },
     async createRoutine(body = {}) {
       return serialiseWrite(async () => {
@@ -496,6 +631,59 @@ export async function createService({ dataDir, fetchImpl = globalThis.fetch } = 
         }
       });
     },
+    async publishLocalRoutine(id) {
+      if (!safeId(id)) throw new ServiceError('validation', 'Routine id is invalid.');
+      // Claim publication before the remote call. The routine_publications ledger
+      // used by createRoutine/updateRoutine is the durable no-duplicate boundary.
+      const claim = await serialiseWrite(async () => {
+        if (mode() !== 'live') throw new ServiceError('live_mode_required', 'Switch to live data before publishing a local routine.', 409);
+        const mapped = db.prepare('SELECT remote_id, result_json FROM local_routine_mappings WHERE local_id = ?').get(id);
+        if (mapped) {
+          if (mapped.result_json) return { mapped: parse(mapped.result_json) };
+          const saved = db.prepare('SELECT raw_json FROM routines WHERE id = ?').get(mapped.remote_id);
+          if (saved) return { mapped: parse(saved.raw_json) };
+          throw new ServiceError('publication_pending', 'This routine was published and is waiting for a sync.', 409);
+        }
+        const row = db.prepare("SELECT l.* FROM local_routines l JOIN proposals p ON p.id=l.proposal_id WHERE l.id=? AND l.mode='live' AND p.status='accepted'").get(id);
+        if (!row) throw new ServiceError('not_found', 'Accepted local routine was not found.', 404);
+        if (row.publish_status === 'uncertain') throw new ServiceError('publication_uncertain', 'Corpus cannot safely retry this routine publication. Check Hevy before syncing.', 502);
+        if (row.publish_status === 'pending') throw new ServiceError('publication_pending', 'This routine publication is still pending.', 409);
+        if (row.hevy_id) {
+          const imported = db.prepare('SELECT raw_json FROM routines WHERE id = ?').get(row.hevy_id);
+          if (!imported || !row.base_hash || entityHash(parse(imported.raw_json)) !== row.base_hash) throw new ServiceError('stale_target', 'The Hevy routine changed since this local edit was accepted. Sync and review a new proposal.', 409);
+        }
+        const requestId = row.publish_request_id ?? randomUUID();
+        db.prepare('UPDATE local_routines SET publish_request_id=?, publish_status=?, updated_at=? WHERE id=?').run(requestId, 'pending', isoNow(), id);
+        return { row: { ...row, publish_request_id: requestId } };
+      });
+      if (claim.mapped) return claim.mapped.routine ? claim.mapped : { routine: claim.mapped };
+      const local = parse(claim.row.raw_json);
+      const payload = { requestId: claim.row.publish_request_id, title: local.title, notes: local.notes, exercises: local.exercises };
+      let published;
+      try {
+        published = claim.row.hevy_id ? await this.updateRoutine(claim.row.hevy_id, payload) : await this.createRoutine(payload);
+      } catch (error) {
+        await serialiseWrite(async () => {
+          const status = error?.code === 'publication_uncertain' ? 'uncertain' : null;
+          db.prepare('UPDATE local_routines SET publish_status=?, updated_at=? WHERE id=?').run(status, isoNow(), id);
+        });
+        throw error;
+      }
+      await serialiseWrite(async () => {
+        const remoteId = published.routine.id;
+        db.prepare('INSERT INTO local_routine_mappings(local_id, remote_id, result_json, created_at) VALUES (?, ?, ?, ?) ON CONFLICT(local_id) DO UPDATE SET remote_id=excluded.remote_id, result_json=excluded.result_json').run(id, remoteId, json(published), isoNow());
+        if (!claim.row.hevy_id) {
+          const affected = db.prepare('SELECT id, days_json FROM programs WHERE mode = ?').all('live');
+          const update = db.prepare('UPDATE programs SET days_json=?, updated_at=? WHERE id=?');
+          for (const program of affected) {
+            const days = parse(program.days_json); const remapped = days.map((day) => day.routineId === id ? { ...day, routineId: remoteId } : day);
+            if (JSON.stringify(days) !== JSON.stringify(remapped)) update.run(json(remapped), isoNow(), program.id);
+          }
+        }
+        db.prepare('DELETE FROM local_routines WHERE id = ?').run(id);
+      });
+      return published;
+    },
     async setDemo(enabled) {
       if (typeof enabled !== 'boolean') throw new ServiceError('validation', 'Demo mode must be true or false.');
       setMeta('mode', enabled ? 'demo' : 'live');
@@ -507,7 +695,7 @@ export async function createService({ dataDir, fetchImpl = globalThis.fetch } = 
       const title = cleanText(body.title, PROGRAM_TITLE_MAX, 'Title', true);
       const description = cleanText(body.description, PROGRAM_DESCRIPTION_MAX, 'Description');
       if (!Array.isArray(body.days) || body.days.length < 1 || body.days.length > 14) throw new ServiceError('validation', 'Program needs between 1 and 14 days.');
-      const routineIds = new Set((currentMode === 'demo' ? demoState().routines : db.prepare('SELECT id FROM routines').all()).map((routine) => routine.id));
+      const routineIds = new Set(visibleRoutines(currentMode).map((routine) => routine.id));
       const days = body.days.map((day) => {
         if (!day || typeof day !== 'object') throw new ServiceError('validation', 'Each program day must be an object.');
         const label = cleanText(day.label, 100, 'Day label', true);
