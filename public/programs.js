@@ -1,4 +1,5 @@
 import { openRoutineBuilder } from './routine-builder.js';
+import { openMuscleCoverage } from './muscle-map.js';
 import { localDateKey, programTimeline, summarizeProgram } from './program-timeline.js';
 
 function dateLabel(value) {
@@ -67,7 +68,10 @@ export function renderPrograms(ctx) {
     add(card, node('p', 'card-kicker', `${program.days.length} training days`), node('h2', '', program.title), node('p', '', program.description || 'Your local training plan.'), renderProgramProgress(ctx, program));
     const list = node('ol', 'day-list');
     for (const day of program.days) list.append(node('li', '', `${day.label} · ${routines.get(day.routineId)?.title || 'Routine no longer available in Hevy'}`));
-    const actions = node('div', 'dialog-actions'); add(actions, button('Edit program', () => editProgram(program)), button('Delete', () => deleteProgram(program), 'button ghost'));
+    const actions = node('div', 'dialog-actions card-actions'); add(actions,
+      button('Muscle coverage', () => openMuscleCoverage(ctx, { program }), 'button secondary'),
+      button('Edit program', () => editProgram(program)),
+      button('Delete', () => deleteProgram(program), 'button ghost'));
     add(card, list, actions); grid.append(card);
   }
   if (!state.programs.length) grid.append(add(node('div', 'panel'), node('h2', '', 'Give your training a structure'), node('p', '', 'Create a program by choosing a routine for each training day. Your workouts are still logged in Hevy.')));
@@ -104,7 +108,9 @@ export function renderPrograms(ctx) {
       }
       section.append(list); content.append(section);
     }
-    details.append(content); const actions = node('div', 'dialog-actions'); actions.append(button('Edit routine', () => openRoutineBuilder(ctx, routine), 'button secondary'));
+    details.append(content); const actions = node('div', 'dialog-actions card-actions'); add(actions,
+      button('Muscle coverage', () => openMuscleCoverage(ctx, { routine }), 'button secondary'),
+      button('Edit routine', () => openRoutineBuilder(ctx, routine), 'button secondary'));
     card.append(details, actions); routineGrid.append(card);
   }
   if (!state.routines.length) routineGrid.append(add(node('div', 'panel'), node('h3', '', 'No routines yet'), node('p', '', 'Connect Hevy in Settings, then sync to import your saved workouts.')));

@@ -63,6 +63,12 @@ Program cards show the inclusive date range, upcoming/active/completed status, c
 
 Sessions receive program labels when their Hevy routine ID matches a program day and their local start date falls within that block. Use the **Program** filter in Sessions to review a block. Reusing a routine outside the block does not associate those sessions; overlapping programs can both match a session. Changing a program's dates or routines recalculates associations, so keep completed blocks and create a new program for your next cycle if you want separate records. Program weeks begin on the chosen start date, while the main dashboard uses Monday-based weeks. Dates follow your laptop's local timezone.
 
+## Inspect planned muscle coverage
+
+In **Programs**, select **Muscle coverage** on a program or saved routine. The front and back figures highlight muscle groups from your synced Hevy exercise templates. Choose **Exercises** or **Working sets**, and include secondary muscles when you want to see their contributions alongside primary targets. Select a muscle to inspect the exercises behind its count.
+
+Routine counts cover one session of that routine. Program counts cover one pass through its listed training days; a routine listed twice contributes twice. The view does not multiply by the program's duration or assume the day list is a weekly schedule. Working sets exclude warmups. Repeated muscle tags within one exercise count once, with primary taking precedence over secondary. These are planned coverage counts, not measured muscle activation or an ideal training-volume prescription. The fixed shading scale makes counts comparable between views; exact counts remain available in the breakdown. Missing exercise metadata and categories without a body region are identified explicitly.
+
 ## Configure Hevy
 
 Create a key in Hevy at <https://hevy.com/settings?developer>. The UI has a local settings form for the key. For command-line use, `HEVY_API_KEY` can be supplied through the process environment. Keep the key out of source control; local settings are intended to be stored with mode `0600`.
