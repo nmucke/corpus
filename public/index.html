@@ -23,11 +23,11 @@
           <details class="nav-group" open>
             <summary><span class="nav-icon" aria-hidden="true">◫</span>Workout<span class="nav-chevron" aria-hidden="true">›</span></summary>
             <div class="nav-group-links">
-              <a href="#overview" data-route="overview" class="is-active">Overview</a>
+              <a href="#overview" data-route="overview">Overview</a>
               <a href="#sessions" data-route="sessions">Sessions</a>
               <a href="#programs" data-route="programs">Programs</a>
               <a href="#exercises" data-route="exercises">Exercises</a>
-              <a href="#proposals" data-route="proposals"><span>AI drafts</span><span class="nav-count" id="proposals-badge" hidden aria-label="Pending AI drafts"></span></a>
+              <a href="#proposals" data-route="proposals"><span>AI drafts</span><span class="pill pill--accent nav-count" id="proposals-badge" hidden aria-label="Pending AI drafts"></span></a>
             </div>
           </details>
           <details class="nav-group" open>
@@ -40,16 +40,13 @@
           <a href="#settings" data-route="settings"><span class="nav-icon" aria-hidden="true">⚙</span>Settings</a>
         </nav>
 
-        <div class="future-nav" aria-label="Future features">
-          <p class="sidebar-label">Coming later</p>
-          <div><span>Nutrition</span><small>Soon</small></div>
-          <div><span>Supplements</span><small>Soon</small></div>
-          <div><span>Knowledge</span><small>Soon</small></div>
+        <div class="future-nav">
+          <p class="sidebar-note">Nutrition, supplements and knowledge are coming later.</p>
         </div>
 
         <div class="sidebar-foot">
           <span class="privacy-dot" aria-hidden="true"></span>
-          <p><strong>Local by design</strong><br>Your key stays on this device.</p>
+          <p><strong>Local by design</strong><br>Your data and keys never leave this device.</p>
         </div>
       </aside>
 
@@ -61,11 +58,8 @@
             <button class="text-button" type="button" id="mode-toggle" hidden></button>
           </div>
           <div class="top-actions">
-            <button class="button secondary" type="button" id="export-button">
-              <span aria-hidden="true">↓</span><span>Export Markdown</span>
-            </button>
-            <button class="button primary" type="button" id="sync-button">
-              <span class="sync-icon" aria-hidden="true">↻</span><span>Sync Hevy</span>
+            <button class="button primary" type="button" id="sync-button" aria-label="Sync connected data sources">
+              <span class="icon" aria-hidden="true">↻</span><span>Sync</span>
             </button>
           </div>
         </header>
@@ -81,7 +75,7 @@
     </div>
 
     <div class="mobile-scrim" id="mobile-scrim" hidden></div>
-    <div class="toast-region" id="toast-region" aria-live="polite" aria-atomic="true"></div>
+    <div class="toast-region" id="toast-region" aria-live="polite"></div>
 
     <dialog class="dialog" id="app-dialog" aria-labelledby="dialog-title">
       <div class="dialog-shell">

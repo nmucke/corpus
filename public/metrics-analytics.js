@@ -1,10 +1,12 @@
 // Pure helpers for the Metrics module: calendar-day math on 'YYYY-MM-DD'
-// strings, gap filling, rolling means, and window summaries. No DOM, no
-// imports, so the server and tests can load it too. Date arithmetic runs on
-// UTC day ordinals so it never drifts across daylight-saving changes.
+// strings, gap filling, rolling means, and window summaries. No DOM, so the
+// server and tests can load it too. Date arithmetic runs on UTC day ordinals
+// so it never drifts across daylight-saving changes.
+
+import { periodDays as rangeDays } from './period.js';
 
 const DAY_MS = 24 * 60 * 60 * 1000;
-const PERIODS = { '4w': 28, '12w': 84, '26w': 182, '1y': 365 };
+const DEFAULT_DAYS = 84;
 
 function calendarParts(value) {
   if (typeof value !== 'string') return null;
@@ -57,7 +59,12 @@ export function listDays(from, to) {
   return days;
 }
 
-export function periodDays(period) { return PERIODS[period] || PERIODS['12w']; }
+/**
+ * Deprecated: the one range vocabulary lives in `period.js` (D10). Kept as a
+ * thin wrapper for callers that still ask this module for a day count; `all`
+ * has no fixed length here and falls back to the default window.
+ */
+export function periodDays(period) { return rangeDays(period) ?? DEFAULT_DAYS; }
 
 /** The `days`-long window that ends on `to` (inclusive). */
 export function dateRange(to, days) {

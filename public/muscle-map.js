@@ -1,5 +1,6 @@
 import { MAPPED_MUSCLES, buildMuscleCoverage } from './muscle-coverage.js';
 import { BACK_REGIONS, BODY_PATHS, FRONT_REGIONS } from './body-anatomy.js';
+import { plural } from './format.js';
 
 const SVG_NS = 'http://www.w3.org/2000/svg';
 const MAPPED = new Set(MAPPED_MUSCLES);
@@ -16,10 +17,6 @@ function intensity(value) {
   if (value === 2) return 2;
   if (value <= 4) return 3;
   return 4;
-}
-
-function plural(value, singular, pluralWord = `${singular}s`) {
-  return `${value} ${value === 1 ? singular : pluralWord}`;
 }
 
 function metricWords(metric) {
@@ -64,41 +61,38 @@ function appendText(parent, ctx, tag, className, text) {
 
 /** Open coverage for one routine or for one pass through every program day. */
 export function openMuscleCoverage(ctx, { routine, program } = {}) {
-  const { state, node, add, openDialog } = ctx;
+  const { state, node, add, button, openDialog, closeDialog } = ctx;
   const coverage = buildMuscleCoverage({ routine, program, routines: state.routines, exerciseTemplates: state.exerciseTemplates });
   const isProgram = coverage.scope === 'program';
   const scopeName = isProgram ? 'program' : 'routine';
   const scopeTitle = isProgram ? (program?.title || 'Untitled program') : (routine?.title || 'Untitled routine');
   const content = node('section', 'muscle-coverage');
-  const lead = node('div', 'coverage-intro');
+  // The dialog header already carries the routine or program name (D15).
   const passLabel = isProgram ? `One pass through ${plural(coverage.dayCount, 'program day')}` : 'One saved routine';
-  add(lead,
-    node('p', 'coverage-scope', scopeTitle),
-    node('p', 'coverage-context', `${passLabel} · ${plural(coverage.exerciseCount, 'exercise entry', 'exercise entries')} · ${plural(coverage.workingSetCount, 'working set')}`),
-    node('p', 'coverage-note', 'Counts show planned exercise and set coverage, not physiological activation.'),
+  const lead = add(node('div', 'coverage-intro'),
+    node('p', 'note coverage-context', `${passLabel} · ${plural(coverage.exerciseCount, 'exercise entry', 'exercise entries')} · ${plural(coverage.workingSetCount, 'working set')}`),
+    node('p', 'note', 'Counts show planned exercise and set coverage, not physiological activation.'),
   );
   content.append(lead);
 
   const controls = node('div', 'coverage-controls');
-  const metricLabel = node('label', 'field coverage-metric');
-  const metric = node('select', 'select'); metric.setAttribute('aria-label', 'Coverage metric');
-  for (const [value, label] of [['exercises', 'Exercises'], ['sets', 'Working sets']]) {
-    const option = node('option', '', label); option.value = value; metric.append(option);
-  }
-  add(metricLabel, node('span', '', 'Measure'), metric);
-  const secondaryLabel = node('label', 'coverage-checkbox');
+  const metricField = ctx.field('Count', { options: [{ value: 'exercises', label: 'Exercises' }, { value: 'sets', label: 'Working sets' }] });
+  metricField.classList.add('coverage-metric');
+  const metric = metricField.control;
+  const secondaryField = node('label', 'checkbox-field');
   const secondary = node('input'); secondary.type = 'checkbox';
-  add(secondaryLabel, secondary, node('span', '', 'Include secondary muscles'));
-  add(controls, metricLabel, secondaryLabel); content.append(controls);
-  const targetNote = node('p', 'coverage-target-note'); content.append(targetNote);
+  add(secondaryField, secondary, node('span', '', 'Include secondary muscles'));
+  add(controls, metricField, secondaryField); content.append(controls);
+  const targetNote = node('p', 'note'); content.append(targetNote);
 
   const status = node('div', 'coverage-status');
-  if (coverage.missingRoutineCount) appendText(status, ctx, 'p', 'coverage-warning', `${plural(coverage.missingRoutineCount, 'selected program day')} ${coverage.missingRoutineCount === 1 ? 'uses' : 'use'} a routine that is no longer available. Its coverage cannot be shown.`);
-  if (coverage.missingTemplateCount) appendText(status, ctx, 'p', 'coverage-warning', `${plural(coverage.missingTemplateCount, 'exercise entry', 'exercise entries')} ${coverage.missingTemplateCount === 1 ? 'has' : 'have'} no matching imported exercise template. ${coverage.missingTemplateCount === 1 ? 'It is' : 'They are'} included in totals but have no muscle target.`);
-  if (coverage.missingMuscleCount) appendText(status, ctx, 'p', 'coverage-warning', `${plural(coverage.missingMuscleCount, 'exercise entry', 'exercise entries')} ${coverage.missingMuscleCount === 1 ? 'uses' : 'use'} an imported template with no muscle target. ${coverage.missingMuscleCount === 1 ? 'It is' : 'They are'} included in totals but have no muscle target.`);
+  if (coverage.missingRoutineCount) appendText(status, ctx, 'p', 'form-warning', `${plural(coverage.missingRoutineCount, 'selected program day')} ${coverage.missingRoutineCount === 1 ? 'uses' : 'use'} a routine that is no longer available. Its coverage cannot be shown.`);
+  if (coverage.missingTemplateCount) appendText(status, ctx, 'p', 'form-warning', `${plural(coverage.missingTemplateCount, 'exercise entry', 'exercise entries')} ${coverage.missingTemplateCount === 1 ? 'has' : 'have'} no matching imported exercise template. ${coverage.missingTemplateCount === 1 ? 'It is' : 'They are'} included in totals with no muscle target.`);
+  if (coverage.missingMuscleCount) appendText(status, ctx, 'p', 'form-warning', `${plural(coverage.missingMuscleCount, 'exercise entry', 'exercise entries')} ${coverage.missingMuscleCount === 1 ? 'uses' : 'use'} an imported template with no muscle target. ${coverage.missingMuscleCount === 1 ? 'It is' : 'They are'} included in totals with no muscle target.`);
   if (status.childElementCount) content.append(status);
 
   const visual = node('div', 'coverage-results'); content.append(visual);
+  content.append(add(node('div', 'dialog-actions'), button('Close', { onClick: () => closeDialog() })));
   let selectedId = coverage.muscles.find(muscle => muscle.primaryExercises || muscle.secondaryExercises)?.id || MAPPED_MUSCLES[0];
   let countsOpen = false;
 
@@ -115,13 +109,13 @@ export function openMuscleCoverage(ctx, { routine, program } = {}) {
     const front = node('figure', 'coverage-figure'); add(front, muscleMap('front', muscles, metricId, includeSecondary, selectedId, choose), node('figcaption', '', 'Front'));
     const back = node('figure', 'coverage-figure'); add(back, muscleMap('back', muscles, metricId, includeSecondary, selectedId, choose), node('figcaption', '', 'Back'));
     add(figures, front, back); visual.append(figures);
-    const legend = node('div', 'coverage-legend'); legend.setAttribute('aria-label', `Coverage intensity by ${metricId === 'sets' ? 'working sets' : 'exercise entries'}`);
+    const legend = node('div', 'chart-legend coverage-legend'); legend.setAttribute('aria-label', `Coverage intensity by ${metricId === 'sets' ? 'working sets' : 'exercise entries'}`);
     legend.append(node('span', 'coverage-legend-label', 'Lower → higher'));
     for (const [bucket, label] of [['0', '0'], ['1', '1'], ['2', '2'], ['3', '3–4'], ['4', '5+']]) {
-      const item = node('span', 'coverage-legend-item'); item.dataset.intensity = bucket; add(item, node('i'), node('span', '', label)); legend.append(item);
+      legend.append(add(node('span'), node('i', `legend-map legend-map-${bucket}`), node('span', '', label)));
     }
     visual.append(legend);
-    if (!mappedWithWork) appendText(visual, ctx, 'p', 'coverage-empty', `No mapped muscles have ${metricId === 'sets' ? 'working sets' : 'exercise entries'} in this view. Try including secondary muscles or changing the measure.`);
+    if (!mappedWithWork) appendText(visual, ctx, 'p', 'coverage-empty', `No mapped muscles have ${metricId === 'sets' ? 'working sets' : 'exercise entries'} in this view. Try including secondary muscles or changing the count.`);
     const words = metricWords(metricId);
     const notDrawn = coverage.muscles.filter(muscle => !MAPPED.has(muscle.id) && (muscle.primaryExercises || muscle.secondaryExercises));
     if (notDrawn.length) {
@@ -129,7 +123,7 @@ export function openMuscleCoverage(ctx, { routine, program } = {}) {
         const value = measure(muscle, metricId, includeSecondary);
         return `${muscle.label} (${value.primary} primary · ${value.secondary} secondary ${words[1]})`;
       });
-      appendText(visual, ctx, 'p', 'coverage-unmapped-summary', `Not drawn on the body map: ${items.join(' · ')}.`);
+      appendText(visual, ctx, 'p', 'note', `Not drawn on the body map: ${items.join(' · ')}.`);
     }
 
     const current = muscles.get(selectedId);
@@ -139,7 +133,7 @@ export function openMuscleCoverage(ctx, { routine, program } = {}) {
       : `${plural(current.primaryExercises, 'primary exercise entry', 'primary exercise entries')} · ${plural(current.secondaryExercises, 'secondary exercise entry', 'secondary exercise entries')}`;
     add(details, node('h3', '', `${current.label} details`), node('p', 'coverage-detail-total', exact));
     if (!current.contributions.length) {
-      appendText(details, ctx, 'p', 'field-hint', `No planned exercise entries list ${current.label.toLowerCase()} as a target in this ${scopeName}.`);
+      appendText(details, ctx, 'p', 'coverage-empty', `No planned exercise entries list ${current.label.toLowerCase()} as a target in this ${scopeName}.`);
     } else {
       const contributionList = node('ol', 'coverage-contributions');
       for (const item of current.contributions) {
@@ -153,7 +147,8 @@ export function openMuscleCoverage(ctx, { routine, program } = {}) {
     visual.append(details);
 
     const counts = node('details', 'coverage-counts'); counts.open = countsOpen;
-    const countsSummary = node('summary', '', 'All muscle counts'); counts.append(countsSummary);
+    const chevron = node('span', 'disclosure-chevron', '›'); chevron.setAttribute('aria-hidden', 'true');
+    counts.append(add(node('summary'), chevron, node('span', '', 'All muscle counts')));
     counts.addEventListener('toggle', () => { if (counts.isConnected) countsOpen = counts.open; });
     const rows = node('div', 'coverage-muscle-list');
     for (const muscle of coverage.muscles) {
@@ -162,7 +157,7 @@ export function openMuscleCoverage(ctx, { routine, program } = {}) {
       row.setAttribute('aria-pressed', String(selectedId === muscle.id));
       row.setAttribute('aria-label', `Show ${muscle.label} exercise details`);
       const label = node('span', 'coverage-muscle-name', muscle.label);
-      if (!MAPPED.has(muscle.id)) label.append(node('small', 'coverage-unmapped', 'Unmapped'));
+      if (!MAPPED.has(muscle.id)) label.append(node('small', 'micro-tag', 'Unmapped'));
       const numbers = node('span', 'coverage-muscle-count', `${value.primary} primary · ${value.secondary} secondary ${words[1]}`);
       row.dataset.muscle = muscle.id;
       add(row, label, numbers); row.addEventListener('click', () => choose(muscle.id, 'list')); rows.append(row);
@@ -174,5 +169,5 @@ export function openMuscleCoverage(ctx, { routine, program } = {}) {
   metric.addEventListener('change', () => refresh());
   secondary.addEventListener('change', () => refresh());
   refresh();
-  openDialog(isProgram ? 'Program coverage' : 'Routine coverage', 'Muscle coverage', content);
+  openDialog('Muscle coverage', scopeTitle, content);
 }

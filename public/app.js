@@ -3,16 +3,36 @@ import {
   exerciseProgress,
   filterByPeriod,
   muscleDistribution,
+  periodStart,
   summarize,
   templateMap,
   weeklySeries,
   workoutVolume,
 } from "./analytics.js";
-import { renderMetricsDashboard, renderMetricsTrends } from "./metrics.js";
+import { invalidateMetrics, renderMetricsDashboard, renderMetricsTrends } from "./metrics.js";
 import { renderPrograms as renderProgramsModule, renderProgramProgress } from "./programs.js";
-import { matchingPrograms, programTimeline } from "./program-timeline.js";
+import { localDateKey, matchingPrograms, programTimeline } from "./program-timeline.js";
 import { pendingCount, renderProposals } from "./proposals.js";
 import { renderSettings as renderSettingsModule } from "./settings.js";
+import { barChart, lineChart, mountChart } from "./metric-charts.js";
+import {
+  MISSING,
+  MISSING_ROUTINE,
+  NEVER_SYNCED,
+  NOT_SET,
+  convertKg,
+  dateLabel,
+  formatCompact,
+  formatDateTime,
+  formatDay,
+  formatDuration,
+  formatLoad,
+  formatNumber,
+  formatSeconds,
+  formatSet,
+  plural,
+} from "./format.js";
+import { PERIODS, analyticsPeriod, getPeriod, periodDays, periodLabel, periodWeeks, setPeriod } from "./period.js";
 
 const root = document.querySelector("#view-root");
 const loading = document.querySelector("#loading-view");
@@ -23,18 +43,30 @@ const dialogEyebrow = document.querySelector("#dialog-eyebrow");
 const modeBadge = document.querySelector("#mode-badge");
 const modeToggle = document.querySelector("#mode-toggle");
 const syncButton = document.querySelector("#sync-button");
-const exportButton = document.querySelector("#export-button");
 const menuButton = document.querySelector("#menu-button");
 const scrim = document.querySelector("#mobile-scrim");
 
+/** One string table for the data-mode vocabulary (D6). */
+export const MODE_COPY = {
+  badge: { demo: "Demo data", live: "Live data" },
+  // Keyed by the mode the app is in; the label names the mode it switches to.
+  toggle: { demo: "Use my data", live: "View demo data" },
+  // Keyed by the mode that was just turned on.
+  toast: {
+    demo: { title: "Demo data on", body: "Demo and live archives stay separate." },
+    live: { title: "Live data on", body: "Demo and live archives stay separate." },
+  },
+  error: "Couldn’t switch data mode",
+};
+
 let state = null;
-let period = "8";
 let selectedExerciseId = "";
 let sessionQuery = "";
 let sessionExercise = "all";
 let sessionProgram = "all";
 let csrfSession = null;
 let proposalPollTimer = null;
+let lastRoute = null;
 
 const node = (tag, className, text) => {
   const element = document.createElement(tag);
@@ -88,227 +120,366 @@ function toast(title, message = "", type = "success") {
   window.setTimeout(() => item.remove(), 4800);
 }
 
-function setBusy(button, busy) {
-  button.disabled = busy;
-  button.classList.toggle("syncing", busy);
+/** In-flight feedback. `:disabled` means unavailable; `.is-busy` means working. */
+function setBusy(control, busy) {
+  if (!control) return;
+  control.disabled = Boolean(busy);
+  control.classList.toggle("is-busy", Boolean(busy));
 }
 
 function templateById() { return templateMap(state?.exerciseTemplates || []); }
 function unit() { return state?.settings?.unit || "kg"; }
-function convertKg(value) { return unit() === "lb" ? value * 2.2046226218 : value; }
-function formatNumber(value, digits = 0) {
-  return new Intl.NumberFormat(undefined, { maximumFractionDigits: digits }).format(value || 0);
+/** Hevy's exercise type enum as a human label: `weight_reps` → "Weight & reps". */
+function exerciseKind(type) {
+  const parts = String(type || "exercise").split("_").filter(Boolean);
+  const label = parts.length === 2 ? `${parts[0]} & ${parts[1]}` : parts.join(" ");
+  return label.charAt(0).toUpperCase() + label.slice(1);
 }
-function formatVolume(kg) {
-  const value = convertKg(kg);
-  if (value >= 1000000) return `${formatNumber(value / 1000000, 1)}m`;
-  if (value >= 1000) return `${formatNumber(value / 1000, 1)}k`;
-  return formatNumber(value);
-}
-function formatDuration(minutes) {
-  if (minutes < 60) return `${minutes}m`;
-  const hours = Math.floor(minutes / 60);
-  const remainder = minutes % 60;
-  return remainder ? `${hours}h ${remainder}m` : `${hours}h`;
-}
-function dateLabel(value, options = { month: "short", day: "numeric" }) {
-  const date = new Date(value);
-  return Number.isNaN(date.getTime()) ? "Unknown date" : new Intl.DateTimeFormat(undefined, options).format(date);
-}
+
+function titleCase(value) { return String(value || "").replaceAll("_", " ").replace(/\b\w/g, (letter) => letter.toUpperCase()); }
+
 function route() {
   const value = location.hash.slice(1).split("/")[0];
   return ["overview", "sessions", "programs", "proposals", "exercises", "metrics", "metrics-trends", "settings"].includes(value) ? value : "overview";
 }
 
-function heading(eyebrow, title, description, action) {
+/* ---------------------------------------------------------------- helpers */
+
+/** The one view header: eyebrow → h1 → description, actions in `.view-actions`. */
+function heading(eyebrow, title, description, ...actions) {
   const header = node("header", "view-header");
   const copy = node("div", "view-heading");
-  add(copy, node("p", "eyebrow", eyebrow), node("h1", "", title), description ? node("p", "", description) : null);
+  add(copy, eyebrow ? node("p", "eyebrow", eyebrow) : null, node("h1", "", title), description ? node("p", "", description) : null);
+  add(header, copy);
+  const items = actions.flat().filter(Boolean);
+  if (items.length) add(header, add(node("div", "view-actions"), items));
+  return header;
+}
+
+function panelHeader(title, subtitle, extra) {
+  const header = node("header", "panel-header");
+  const copy = node("div");
+  add(copy, node("h2", "", title), subtitle ? node("p", "", subtitle) : null);
+  add(header, copy, extra);
+  return header;
+}
+
+/** An in-page section title for content that is not inside a panel. */
+function sectionHeading(title, subtitle, action) {
+  const header = node("header", "section-heading");
+  const copy = node("div");
+  add(copy, node("h2", "", title), subtitle ? node("p", "", subtitle) : null);
   add(header, copy, action);
   return header;
 }
 
-function periodPicker() {
+function emptyState({ title, copy = "", icon = "○", action = null, compact = false } = {}) {
+  const empty = node("div", compact ? "empty-state is-compact" : "empty-state");
+  if (icon) {
+    const glyph = node("span", "empty-state-icon", icon);
+    glyph.setAttribute("aria-hidden", "true");
+    empty.append(glyph);
+  }
+  add(empty, node("p", "empty-state-title", title), copy ? node("p", "", copy) : null, action);
+  return empty;
+}
+
+/** `▲ 12 vs previous 12 weeks`, or a flat note when there is nothing to compare. */
+function statDelta(change, format, decimals = 0) {
+  if (change == null) return [node("span", "stat-delta flat", "no previous window")];
+  const rounded = Number(Number(change).toFixed(decimals));
+  if (rounded === 0) return [node("span", "stat-delta flat", `no change vs previous ${periodLabel(getPeriod())}`)];
+  const up = rounded > 0;
+  const span = node("span", `stat-delta ${up ? "up" : "down"}`);
+  const glyph = node("span", "", up ? "▲" : "▼");
+  glyph.setAttribute("aria-hidden", "true");
+  add(span, glyph, node("span", "sr-only", up ? "Up" : "Down"), node("span", "", ` ${format(Math.abs(rounded))}`));
+  return [span, document.createTextNode(` vs previous ${periodLabel(getPeriod())}`)];
+}
+
+function statCard(label, value, { change, format = (input) => formatNumber(input), decimals = 0, suffix = "" } = {}) {
+  const card = add(node("article", "card stat-card"), node("p", "stat-label", label), node("p", "stat-value", value));
+  if (change !== undefined || suffix) {
+    const note = node("p", "stat-note");
+    add(note, change === undefined ? null : statDelta(change, format, decimals), suffix ? document.createTextNode(`${change === undefined ? "" : " · "}${suffix}`) : null);
+    card.append(note);
+  }
+  return card;
+}
+
+function miniMetric(label, value) {
+  return add(node("div", "mini-metric"), node("span", "", label), node("strong", "", value));
+}
+
+/** The shared range picker; `onChange` defaults to a full re-render. */
+function periodPicker(onChange) {
   const picker = node("div", "period-picker");
   picker.setAttribute("aria-label", "Date range");
-  for (const [value, label] of [["4", "4 weeks"], ["8", "8 weeks"], ["12", "12 weeks"], ["all", "All"]]) {
-    const button = node("button", "", label);
-    button.type = "button";
-    button.dataset.period = value;
-    button.setAttribute("aria-pressed", String(value === period));
-    button.addEventListener("click", () => { period = value; render(); });
-    picker.append(button);
+  const current = getPeriod();
+  for (const [value, label] of PERIODS) {
+    const control = node("button", "", label);
+    control.type = "button";
+    control.dataset.period = value;
+    control.setAttribute("aria-pressed", String(value === current));
+    control.addEventListener("click", () => {
+      if (getPeriod() === value) return;
+      setPeriod(value);
+      if (onChange) onChange(value); else render();
+    });
+    picker.append(control);
   }
   return picker;
 }
 
-function emptyState(title, copy, icon = "○") {
-  const empty = node("div", "empty-state");
-  add(empty, node("div", "empty-state-icon", icon), node("h2", "", title), node("p", "", copy));
-  return empty;
+/**
+ * `label.field > span.field-label + control (+ p.field-hint)`. The control is
+ * reachable as the label's native `.control` property.
+ */
+function field(label, {
+  tag = "input", type = "text", value = "", placeholder = "", hint = "", required = false,
+  options = null, rows = 0, maxLength = 0, name = "", autocomplete = "",
+} = {}) {
+  const wrapper = node("label", "field");
+  add(wrapper, node("span", "field-label", label));
+  const controlTag = options ? "select" : tag;
+  const className = controlTag === "select" ? "select" : controlTag === "textarea" ? "textarea" : "input";
+  const control = node(controlTag, className);
+  if (controlTag === "input") control.type = type;
+  if (options) {
+    for (const option of options) {
+      const entry = typeof option === "string" ? { value: option, label: option } : option;
+      const element = node("option", "", entry.label ?? entry.title ?? entry.value);
+      element.value = entry.value ?? entry.id ?? "";
+      control.append(element);
+    }
+  }
+  if (placeholder) control.placeholder = placeholder;
+  if (required) control.required = true;
+  if (rows) control.rows = rows;
+  if (maxLength) control.maxLength = maxLength;
+  if (name) control.name = name;
+  if (autocomplete) control.autocomplete = autocomplete;
+  if (value != null && value !== "") control.value = String(value);
+  add(wrapper, control, hint ? node("p", "field-hint", hint) : null);
+  return wrapper;
 }
 
-function statCard(label, value, note) {
-  return add(node("article", "stat-card"), node("p", "stat-label", label), node("p", "stat-value", value), node("p", "stat-note", note));
+function button(label, { variant = "secondary", size = "", icon = "", onClick = null, type = "button", title = "" } = {}) {
+  const classes = ["button", variant];
+  if (size) classes.push(size);
+  if (icon && !label) classes.push("icon");
+  const control = node("button", classes.join(" "));
+  control.type = type;
+  if (icon) {
+    const glyph = node("span", "icon", icon);
+    glyph.setAttribute("aria-hidden", "true");
+    control.append(glyph);
+  }
+  if (label) control.append(node("span", "", label));
+  else if (title) control.setAttribute("aria-label", title);
+  if (title) control.title = title;
+  if (onClick) control.addEventListener("click", onClick);
+  return control;
 }
 
-function demoBanner() {
-  if (state.mode !== "demo") return null;
-  const banner = node("div", "demo-banner");
-  add(banner, node("span", "demo-banner-icon", "D"));
-  const copy = node("p");
-  add(copy, node("strong", "", "You’re viewing demo training data. "), document.createTextNode("Connect your Hevy account in Settings whenever you’re ready."));
-  const link = node("a", "text-button", "Open settings");
+function settingsLink(text = "Open Settings", { asButton = false } = {}) {
+  const link = node("a", asButton ? "button secondary" : "text-button", text);
   link.href = "#settings";
-  add(banner, copy, link);
-  return banner;
+  return link;
 }
+
+/** The one demo marker, rendered by the router on every route (D9). */
+function demoNotice() {
+  const notice = node("div", "notice notice--demo");
+  const icon = node("span", "notice-icon", "D");
+  icon.setAttribute("aria-hidden", "true");
+  const body = node("div", "notice-body");
+  add(body, node("p", "", "You’re viewing demo data. Demo and live archives stay separate."));
+  // On Settings the link would point at the page the user is already on.
+  const action = route() === "settings" ? null : add(node("div", "notice-action"), settingsLink());
+  return add(notice, icon, body, action);
+}
+
+/* ------------------------------------------------------------ global actions */
+
+async function setMode(enableDemo, control = modeToggle) {
+  setBusy(control, true);
+  try {
+    await api("/api/demo", { method: "POST", body: JSON.stringify({ enabled: enableDemo }) });
+    invalidateMetrics();
+    await loadState();
+    const copy = MODE_COPY.toast[enableDemo ? "demo" : "live"];
+    toast(copy.title, copy.body);
+  } catch (error) {
+    toast(MODE_COPY.error, error.message || "Please try again.", "error");
+  } finally {
+    setBusy(control, false);
+  }
+}
+
+/** Syncs every connected source, then reports one toast (D1/D2). */
+async function syncAll() {
+  const hevy = Boolean(state?.settings?.hasApiKey);
+  const google = Boolean(state?.settings?.googleHealth?.connected);
+  if (!hevy && !google) {
+    location.hash = "#settings";
+    toast("Connect a data source", "Save your Hevy key or connect Google Health in Settings, then sync.");
+    return;
+  }
+  setBusy(syncButton, true);
+  const done = [];
+  const warnings = [];
+  let imported = 0;
+  try {
+    if (hevy) {
+      try {
+        await api("/api/sync", { method: "POST", body: "{}" });
+        done.push("hevy");
+      } catch (error) {
+        toast("Couldn’t sync Hevy", error.message || "Please try again.", "error");
+      }
+    }
+    if (google) {
+      try {
+        const result = await api("/api/metrics/sync", { method: "POST", body: "{}" });
+        invalidateMetrics();
+        imported = Number(result?.imported) || 0;
+        warnings.push(...(Array.isArray(result?.warnings) ? result.warnings.filter(Boolean) : []));
+        done.push("google");
+      } catch (error) {
+        toast("Couldn’t sync Google Health", error.message || "Please try again.", "error");
+      }
+    }
+    await loadState();
+    if (!done.length) return;
+    const sources = [];
+    if (done.includes("hevy")) sources.push(`Hevy: ${plural(state.workouts.length, "workout")}`);
+    if (done.includes("google")) sources.push(`Google Health: ${plural(imported, "data point")}`);
+    const extra = [...warnings];
+    if (state.mode === "demo") extra.push("Switch to live data to see the changes.");
+    toast("Sync complete", [sources.join(" · "), ...extra].filter(Boolean).join(" "));
+  } finally {
+    setBusy(syncButton, false);
+  }
+}
+
+/* ------------------------------------------------------------------ overview */
 
 function renderOverview() {
-  const view = node("section", "view overview-view");
-  add(view, heading("Training overview", "Your training, in perspective.", "A clear view of the work you’ve put in — and where it’s taking you.", periodPicker()), demoBanner());
+  const view = node("section", "view section-page");
+  add(view, heading("Workout", "Overview", "Your training, in perspective.", periodPicker()));
   const map = templateById();
-  const summary = summarize(state.workouts, period, new Date(), map);
-  const rangeLabel = period === "all" ? "across your full archive" : `in the last ${period} weeks`;
+  const now = new Date();
+  const span = analyticsPeriod(getPeriod());
+  const displayUnit = unit();
+  const summary = summarize(state.workouts, span, now, map);
+  const previous = previousSummary(span, now, map);
+  const change = (key) => (previous ? summary[key] - previous[key] : null);
+  const volume = convertKg(summary.volumeKg, displayUnit) || 0;
+  const previousVolume = previous ? convertKg(previous.volumeKg, displayUnit) || 0 : null;
+
   const stats = node("div", "stat-grid");
   add(stats,
-    statCard("Workouts", formatNumber(summary.workouts), rangeLabel),
-    statCard("Training volume", formatVolume(summary.volumeKg), `${unit()}·reps · working sets`),
-    statCard("Weekly consistency", `${summary.consistency}%`, `${summary.activeWeeks} of ${summary.totalWeeks} weeks active`),
-    statCard("Time trained", formatDuration(summary.minutes), rangeLabel),
+    statCard("Workouts", formatNumber(summary.workouts), { change: change("workouts") }),
+    statCard(`Training volume (${displayUnit}·reps)`, formatNumber(volume), { change: previous ? volume - previousVolume : null }),
+    statCard("Weekly consistency", `${summary.consistency}%`, {
+      change: change("consistency"),
+      format: (value) => `${formatNumber(value)} pts`,
+      suffix: `${summary.activeWeeks} of ${summary.totalWeeks} weeks active`,
+    }),
+    statCard("Time trained", formatDuration(summary.minutes), { change: change("minutes"), format: (value) => formatDuration(value) }),
   );
   view.append(programOverview(), stats);
-  const filtered = filterByPeriod(state.workouts, period, new Date());
+
+  const filtered = filterByPeriod(state.workouts, span, now);
   const grid = node("div", "dashboard-grid");
-  grid.append(volumePanel(map), musclePanel(filtered, map), progressPanel(filtered, map), recentPanel(filtered, map));
+  add(grid, volumePanel(map, span, now, displayUnit), progressPanel(filtered, map, displayUnit), recentPanel(filtered, map, displayUnit), musclePanel(filtered, map));
   view.append(grid);
   return view;
 }
 
+/**
+ * The window immediately before the current one. Null for the full archive and
+ * for an empty preceding window, which is a gap rather than a baseline.
+ */
+function previousSummary(span, now, map) {
+  const start = periodStart(span, now);
+  if (!start) return null;
+  const previous = summarize(state.workouts, span, new Date(start.getTime() - 1), map);
+  return previous.workouts ? previous : null;
+}
+
 function programOverview() {
   const panel = node("section", "panel program-overview");
-  const link = node("a", "text-button", "Manage programs"); link.href = "#programs";
+  const link = node("a", "text-button", "Manage programs");
+  link.href = "#programs";
   const now = new Date();
-  const active = state.programs.filter(program => programTimeline(program, now).status === "active");
+  const active = state.programs.filter((program) => programTimeline(program, now).status === "active");
   add(panel, panelHeader(active.length ? "Currently training" : "No active program", "Program dates and activity · independent of the dashboard date range", link));
   if (!active.length) {
-    const next = state.programs.filter(program => programTimeline(program, now).status === "upcoming").sort((a, b) => a.start_date.localeCompare(b.start_date))[0];
-    panel.append(node("p", "field-hint", next ? `Up next: ${next.title}, starting ${next.start_date}.` : "Set a program’s start date and duration in Programs to follow your training block here."));
+    const next = state.programs.filter((program) => programTimeline(program, now).status === "upcoming").sort((a, b) => a.start_date.localeCompare(b.start_date))[0];
+    panel.append(node("p", "note", next ? `Up next: ${next.title}, starting ${formatDay(next.start_date)}.` : "Set a program’s start date and duration in Programs to follow your training block here."));
     return panel;
   }
-  const grid = node("div", "program-grid");
+  const grid = node("div", "card-grid");
   for (const program of active) {
-    const card = node("article", "program-card");
-    const sessionsLink = node("a", "text-button", "View program sessions"); sessionsLink.href = "#sessions";
+    const card = node("article", "card program-card");
+    const sessionsLink = node("a", "text-button", "View program sessions");
+    sessionsLink.href = "#sessions";
     sessionsLink.addEventListener("click", () => { sessionProgram = program.id; sessionQuery = ""; sessionExercise = "all"; });
-    add(card, node("h2", "", program.title), renderProgramProgress(context(), program, now), sessionsLink);
+    add(card, node("h3", "card-title", program.title), renderProgramProgress(context(), program, now), sessionsLink);
     grid.append(card);
   }
   panel.append(grid);
   return panel;
 }
 
-function sessionProgramBadges(workout, detailed = false) {
-  const programs = matchingPrograms(workout, state.programs);
-  const badges = node("span", "program-badges");
-  for (const program of programs) {
-    const timeline = programTimeline(program, new Date(workout.start_time));
-    const badge = node("span", "program-badge", `${program.title} · week ${timeline.currentWeek}`);
-    badge.title = `Matched by routine and session date: ${timeline.startDate} – ${timeline.endDate}`;
-    badges.append(badge);
-  }
-  if (!programs.length) badges.append(node("span", "field-hint", "No program match"));
-  if (!detailed) return badges;
-  return add(node("div"), badges, node("p", "field-hint", "Program matches use the selected routines and local session dates. Changing a program’s dates or routines recalculates these matches."));
-}
-
-function panelHeader(title, subtitle, extra) {
-  const header = node("header", "panel-header");
-  const copy = node("div");
-  add(copy, node("h2", "", title), node("p", "", subtitle));
-  add(header, copy, extra);
-  return header;
-}
-
-function volumePanel(map) {
+function volumePanel(map, span, now, displayUnit) {
   const panel = node("section", "panel full-span");
-  const legend = node("div", "chart-legend");
-  const a = node("span"); add(a, node("i"), document.createTextNode(`Volume (${unit()}·reps)`));
-  const b = node("span"); add(b, node("i"), document.createTextNode("Workouts"));
-  add(legend, a, b);
-  add(panel, panelHeader("Training volume & activity", "Weekly totals · warm-ups, bodyweight and cardio excluded from volume", legend));
-  const series = weeklySeries(state.workouts, period, new Date(), map);
-  panel.append(buildChart(series));
+  add(panel, panelHeader("Training volume & activity", "Weekly totals · warm-ups, bodyweight and cardio excluded from volume"));
+  const series = weeklySeries(state.workouts, span, now, map);
+  const points = series.map((point) => ({ date: localDateKey(point.start), value: convertKg(point.volumeKg, displayUnit) }));
+  const counts = series.map((point) => point.workouts);
+  const mount = node("div", "chart-mount");
+  mountChart(mount, ({ compact }) => barChart({
+    points,
+    compact,
+    label: `Weekly external-load volume in ${displayUnit}·reps and workout count`,
+    seriesLabel: `Volume (${displayUnit}·reps)`,
+    format: (value) => `${formatNumber(value)} ${displayUnit}·reps`,
+    axisFormat: formatCompact,
+    overlay: {
+      values: counts,
+      label: "Workouts",
+      format: compact ? (value) => formatNumber(value) : (value) => plural(value, "workout"),
+    },
+    xLabel: (point) => formatDay(point.date),
+    xLabels: compact ? 4 : 7,
+  }));
+  panel.append(mount);
   return panel;
-}
-
-function svgEl(tag, attributes = {}) {
-  const element = document.createElementNS("http://www.w3.org/2000/svg", tag);
-  for (const [key, value] of Object.entries(attributes)) element.setAttribute(key, value);
-  return element;
-}
-
-function buildChart(series) {
-  const wrap = node("div", "chart-wrap");
-  if (!series.length || !series.some((point) => point.workouts)) {
-    wrap.append(emptyState("No sessions in this range", "Sync or choose a wider date range to see your training rhythm.", "↗"));
-    return wrap;
-  }
-  const width = 760, height = 250, left = 48, right = 22, top = 18, bottom = 34;
-  const plotW = width - left - right, plotH = height - top - bottom;
-  const values = series.map((point) => convertKg(point.volumeKg));
-  const maxVolume = Math.max(...values, 1);
-  const maxWorkouts = Math.max(...series.map((point) => point.workouts), 1);
-  const svg = svgEl("svg", { viewBox: `0 0 ${width} ${height}`, role: "img", "aria-label": `Weekly external-load volume in ${unit()} repetitions and workout count` });
-  const title = svgEl("title"); title.textContent = "Weekly training volume and workout activity"; svg.append(title);
-  for (let i = 0; i <= 4; i++) {
-    const y = top + (plotH / 4) * i;
-    svg.append(svgEl("line", { x1: left, y1: y, x2: width - right, y2: y, class: "chart-grid-line" }));
-    const label = svgEl("text", { x: left - 9, y: y + 3, class: "chart-axis", "text-anchor": "end" });
-    label.textContent = formatVolume(maxVolume * (1 - i / 4) / (unit() === "lb" ? 2.2046226218 : 1));
-    svg.append(label);
-  }
-  const countTop = svgEl("text", { x: width - right + 8, y: top + 3, class: "chart-axis", "text-anchor": "start" });
-  countTop.textContent = `${maxWorkouts} workouts`; svg.append(countTop);
-  const countBottom = svgEl("text", { x: width - right + 8, y: top + plotH + 3, class: "chart-axis", "text-anchor": "start" });
-  countBottom.textContent = "0"; svg.append(countBottom);
-  const slot = plotW / series.length;
-  const barW = Math.min(31, slot * .52);
-  const points = [];
-  series.forEach((point, index) => {
-    const x = left + index * slot + slot / 2;
-    const barH = (values[index] / maxVolume) * plotH;
-    const bar = svgEl("rect", { x: x - barW / 2, y: top + plotH - barH, width: barW, height: Math.max(0, barH), rx: 4, class: "chart-bar" });
-    const barTitle = svgEl("title"); barTitle.textContent = `${dateLabel(point.start)}: ${formatNumber(values[index])} ${unit()}·reps`; bar.append(barTitle); svg.append(bar);
-    const dotY = top + plotH - (point.workouts / maxWorkouts) * plotH;
-    points.push(`${x},${dotY}`);
-    if (index % Math.ceil(series.length / 7) === 0 || index === series.length - 1) {
-      const label = svgEl("text", { x, y: height - 10, class: "chart-axis", "text-anchor": "middle" });
-      label.textContent = dateLabel(point.start); svg.append(label);
-    }
-  });
-  svg.append(svgEl("polyline", { points: points.join(" "), class: "chart-line" }));
-  series.forEach((point, index) => {
-    const [x, y] = points[index].split(",");
-    const dot = svgEl("circle", { cx: x, cy: y, r: 4, class: "chart-dot" });
-    const dotTitle = svgEl("title"); dotTitle.textContent = `${point.workouts} workout${point.workouts === 1 ? "" : "s"}`; dot.append(dotTitle); svg.append(dot);
-  });
-  wrap.append(svg);
-  return wrap;
 }
 
 function musclePanel(workouts, map) {
   const panel = node("section", "panel");
   add(panel, panelHeader("Muscle distribution", "Working sets by primary muscle group"));
   const muscles = muscleDistribution(workouts, map).slice(0, 6);
-  if (!muscles.length) { panel.append(emptyState("No set data", "Muscle distribution appears after a session is logged.")); return panel; }
+  if (!muscles.length) {
+    panel.append(emptyState({ title: "No set data", copy: "Muscle distribution appears after a session is logged.", compact: true }));
+    return panel;
+  }
   const list = node("div", "muscle-list");
   const max = muscles[0].sets;
   for (const item of muscles) {
     const row = node("div", "muscle-row");
-    const top = node("div", "muscle-row-top"); add(top, node("span", "", titleCase(item.muscle)), node("span", "", `${item.sets} sets`));
-    const track = node("div", "track"); const fill = node("span"); fill.style.width = `${(item.sets / max) * 100}%`; track.append(fill);
-    add(row, top, track); list.append(row);
+    const top = node("div", "muscle-row-top");
+    add(top, node("span", "", titleCase(item.muscle)), node("span", "", plural(item.sets, "set")));
+    const track = node("div", "track");
+    const fill = node("span");
+    fill.style.width = `${(item.sets / max) * 100}%`;
+    track.append(fill);
+    add(row, top, track);
+    list.append(row);
   }
   panel.append(list);
   return panel;
@@ -325,176 +496,248 @@ function exerciseChoices(workouts = state.workouts) {
   return [...choices.entries()].map(([id, title]) => ({ id, title })).sort((a, b) => a.title.localeCompare(b.title));
 }
 
-function progressPanel(workouts, map) {
-  const panel = node("section", "panel progress-panel");
+function progressPanel(workouts, map, displayUnit) {
+  const panel = node("section", "panel full-span");
   const choices = exerciseChoices(workouts);
   if (!choices.some((choice) => choice.id === selectedExerciseId)) selectedExerciseId = choices[0]?.id || "";
-  const select = node("select", "select");
-  select.setAttribute("aria-label", "Exercise for progress chart");
-  for (const choice of choices) {
-    const option = node("option", "", choice.title); option.value = choice.id; option.selected = choice.id === selectedExerciseId; select.append(option);
+  const picker = choices.length
+    ? field("Exercise", { options: choices.map((choice) => ({ value: choice.id, label: choice.title })), value: selectedExerciseId })
+    : null;
+  if (picker) picker.control.addEventListener("change", () => { selectedExerciseId = picker.control.value; render(); });
+  add(panel, panelHeader("Exercise progress", "Best external load per session · warm-ups excluded", picker));
+  if (!choices.length) {
+    panel.append(emptyState({ title: "No exercise history", copy: "Exercise progress appears after a loaded exercise is logged.", compact: true }));
+    return panel;
   }
-  select.addEventListener("change", () => { selectedExerciseId = select.value; render(); });
-  add(panel, panelHeader("Exercise progress", "Best external load per session · warm-ups excluded", choices.length ? select : null));
-  if (!choices.length) { panel.append(emptyState("No exercise history", "Exercise progress appears after a loaded exercise is logged.")); return panel; }
   const entries = exerciseProgress(workouts, selectedExerciseId, map);
-  if (!entries.length) { panel.append(emptyState("No external-load sets", "This exercise has no loaded working sets in the selected date range.")); return panel; }
+  if (!entries.length) {
+    panel.append(emptyState({
+      title: "No external-load sets",
+      copy: "This exercise has no loaded working sets in the selected date range.",
+      compact: true,
+      action: button("Show all time", { onClick: () => { setPeriod("all"); render(); }, size: "sm" }),
+    }));
+    return panel;
+  }
   const layout = node("div", "progress-layout");
   const metrics = node("div", "metric-stack");
   const best = Math.max(...entries.map((entry) => entry.bestKg));
   const total = entries.reduce((sum, entry) => sum + entry.volumeKg, 0);
   add(metrics,
-    miniMetric("Best load", `${formatNumber(convertKg(best), 1)} ${unit()}`),
+    miniMetric(`Best load (${displayUnit})`, formatLoad(best, displayUnit)),
     miniMetric("Sessions", formatNumber(entries.length)),
-    miniMetric("Total volume", `${formatVolume(total)} ${unit()}·reps`),
+    miniMetric(`Total volume (${displayUnit}·reps)`, formatNumber(convertKg(total, displayUnit))),
   );
-  add(layout, metrics, progressChart(entries)); panel.append(layout);
+  const points = entries.map((entry) => ({ date: localDateKey(entry.date), value: convertKg(entry.bestKg, displayUnit) }));
+  const mount = node("div", "chart-mount");
+  mountChart(mount, ({ compact }) => lineChart({
+    points,
+    compact,
+    label: `Best external load per session in ${displayUnit}`,
+    format: (value) => `${formatNumber(value, 1)} ${displayUnit}`,
+    decimals: 1,
+    xLabel: (point) => formatDay(point.date),
+    xLabels: compact ? 3 : 6,
+  }));
+  add(layout, metrics, mount);
+  panel.append(layout);
   return panel;
 }
 
-function miniMetric(label, value) {
-  return add(node("div", "mini-metric"), node("span", "", label), node("strong", "", value));
-}
-
-function progressChart(entries) {
-  const wrap = node("div", "chart-wrap");
-  const width = 560, height = 190, left = 20, right = 20, top = 17, bottom = 29;
-  const values = entries.map((entry) => convertKg(entry.bestKg));
-  const min = Math.min(...values), max = Math.max(...values);
-  const spread = Math.max(max - min, max * .1, 1);
-  const pointX = (index) => entries.length === 1 ? width / 2 : left + index * ((width - left - right) / (entries.length - 1));
-  const pointY = (value) => top + (1 - (value - (min - spread * .2)) / (spread * 1.4)) * (height - top - bottom);
-  const points = values.map((value, index) => `${pointX(index)},${pointY(value)}`);
-  const svg = svgEl("svg", { viewBox: `0 0 ${width} ${height}`, role: "img", "aria-label": `Best external load trend in ${unit()}` });
-  for (let i = 0; i < 3; i++) svg.append(svgEl("line", { x1: left, x2: width - right, y1: top + i * 60, y2: top + i * 60, class: "chart-grid-line" }));
-  svg.append(svgEl("polyline", { points: points.join(" "), class: "chart-line" }));
-  entries.forEach((entry, index) => {
-    const dot = svgEl("circle", { cx: pointX(index), cy: pointY(values[index]), r: 5, class: "chart-dot" });
-    const title = svgEl("title"); title.textContent = `${dateLabel(entry.date)}: ${formatNumber(values[index], 1)} ${unit()}`; dot.append(title); svg.append(dot);
-    if (index === 0 || index === entries.length - 1) {
-      const label = svgEl("text", { x: pointX(index), y: height - 7, class: "chart-axis", "text-anchor": index ? "end" : "start" });
-      label.textContent = dateLabel(entry.date); svg.append(label);
-    }
-  });
-  wrap.append(svg); return wrap;
-}
-
-function recentPanel(workouts, map) {
-  const panel = node("section", "panel progress-panel");
-  const link = node("a", "text-button", "View all sessions"); link.href = "#sessions";
+function recentPanel(workouts, map, displayUnit) {
+  const panel = node("section", "panel");
+  const link = node("a", "text-button", "View all sessions");
+  link.href = "#sessions";
   add(panel, panelHeader("Recent sessions", "Your latest work in this date range", link));
   const recent = [...workouts].sort((a, b) => new Date(b.start_time) - new Date(a.start_time)).slice(0, 5);
-  if (!recent.length) { panel.append(emptyState("No recent sessions", "Try a wider date range or sync your Hevy archive.")); return panel; }
-  const list = node("div", "recent-list"); recent.forEach((workout) => list.append(sessionRow(workout, map))); panel.append(list);
+  if (!recent.length) {
+    panel.append(emptyState({
+      title: "No recent sessions",
+      copy: "Nothing was logged in this date range.",
+      compact: true,
+      action: button("Show all time", { onClick: () => { setPeriod("all"); render(); }, size: "sm" }),
+    }));
+    return panel;
+  }
+  const list = node("div", "recent-list");
+  recent.forEach((workout) => list.append(sessionRow(workout, map, displayUnit)));
+  panel.append(list);
   return panel;
 }
 
-function sessionRow(workout, map) {
-  const button = node("button", "session-row"); button.type = "button";
-  button.setAttribute("aria-label", `Open ${workout.title || "workout"} from ${dateLabel(workout.start_time, { dateStyle: "long" })}`);
+function sessionProgramBadges(workout, detailed = false) {
+  const programs = matchingPrograms(workout, state.programs);
+  const badges = node("span", "program-badges");
+  for (const program of programs) {
+    const timeline = programTimeline(program, new Date(workout.start_time));
+    const badge = node("span", "pill pill--neutral", `${program.title} · week ${timeline.currentWeek}`);
+    badge.title = `Matched by routine and session date: ${formatDay(timeline.startDate)} – ${formatDay(timeline.endDate)}`;
+    badges.append(badge);
+  }
+  if (!programs.length) badges.append(node("span", "note", "No program match"));
+  if (!detailed) return badges;
+  return add(node("div"), badges, node("p", "note", "Program matches use the selected routines and local session dates. Changing a program’s dates or routines recalculates these matches."));
+}
+
+function sessionRow(workout, map, displayUnit = unit()) {
+  const control = node("button", "session-row");
+  control.type = "button";
   const date = new Date(workout.start_time);
-  const dateBox = node("span", "session-date"); add(dateBox, node("strong", "", Number.isNaN(date.getTime()) ? "—" : date.getDate()), node("span", "", Number.isNaN(date.getTime()) ? "" : dateLabel(date, { month: "short" })));
+  const valid = !Number.isNaN(date.getTime());
+  const dateBox = node("span", "session-date");
+  add(dateBox, node("strong", "", valid ? date.getDate() : MISSING), node("span", "", valid ? dateLabel(date, { month: "short" }) : ""));
   const main = node("span", "session-main");
   const exerciseCount = workout.exercises?.length || 0;
   const setCount = (workout.exercises || []).reduce((sum, exercise) => sum + (exercise.sets?.length || 0), 0);
-  add(main, node("strong", "", workout.title || "Untitled workout"), node("span", "", `${exerciseCount} exercises · ${setCount} sets`));
-  main.append(sessionProgramBadges(workout));
-  button.setAttribute("aria-label", `${button.getAttribute("aria-label")}. ${main.lastChild.textContent}`);
+  add(main, node("strong", "", workout.title || "Untitled workout"), node("span", "", `${plural(exerciseCount, "exercise")} · ${plural(setCount, "set")}`));
+  const badges = sessionProgramBadges(workout);
+  main.append(badges);
+  control.setAttribute("aria-label", `Open ${workout.title || "workout"} from ${dateLabel(workout.start_time, { dateStyle: "long" })}. ${badges.textContent}`);
   const meta = node("span", "session-meta");
-  const volume = node("span"); add(volume, node("strong", "", `${formatVolume(workoutVolume(workout, map))} ${unit()}·reps`), document.createTextNode("volume"));
-  const time = node("span"); add(time, node("strong", "", formatDuration(durationMinutes(workout))), document.createTextNode("duration"));
+  const volume = node("span");
+  add(volume, node("strong", "", `${formatNumber(convertKg(workoutVolume(workout, map), displayUnit))} ${displayUnit}·reps`), document.createTextNode("volume"));
+  const time = node("span");
+  add(time, node("strong", "", formatDuration(durationMinutes(workout))), document.createTextNode("duration"));
   add(meta, volume, time);
-  add(button, dateBox, main, meta, node("span", "session-arrow", "→"));
-  button.addEventListener("click", () => showSession(workout));
-  return button;
+  add(control, dateBox, main, meta, node("span", "session-arrow", "→"));
+  control.addEventListener("click", () => showSession(workout));
+  return control;
 }
+
+/* ------------------------------------------------------------------ sessions */
 
 function renderSessions() {
   const view = node("section", "view section-page");
-  add(view, heading("Training log", "Sessions", "Search every synced workout and open a session for its full set-by-set record."));
-  const filters = node("div", "filters session-filters");
-  const searchField = node("div", "field search-field");
-  const searchLabel = node("label", "", "Search sessions"); searchLabel.htmlFor = "session-search"; searchField.append(searchLabel);
-  const search = node("input", "input"); search.id = "session-search"; search.type = "search"; search.placeholder = "Workout or exercise"; search.value = sessionQuery;
-  search.addEventListener("input", () => { sessionQuery = search.value; updateSessionResults(results, count); }); searchField.append(search);
-  const exerciseField = node("div", "field"); const exerciseLabel = node("label", "", "Exercise"); exerciseLabel.htmlFor = "session-exercise"; exerciseField.append(exerciseLabel);
-  const select = node("select", "select"); select.id = "session-exercise"; const any = node("option", "", "All exercises"); any.value = "all"; select.append(any);
-  exerciseChoices().forEach((choice) => { const option = node("option", "", choice.title); option.value = choice.id; option.selected = choice.id === sessionExercise; select.append(option); });
-  select.addEventListener("change", () => { sessionExercise = select.value; updateSessionResults(results, count); }); exerciseField.append(select);
-  const programField = node("div", "field"); const programLabel = node("label", "", "Program"); programLabel.htmlFor = "session-program";
-  const programSelect = node("select", "select"); programSelect.id = "session-program";
-  if (sessionProgram !== "all" && sessionProgram !== "none" && !state.programs.some(program => program.id === sessionProgram)) sessionProgram = "all";
-  for (const choice of [{ id: "all", title: "All programs" }, { id: "none", title: "No program match" }, ...state.programs]) {
-    const option = node("option", "", choice.title); option.value = choice.id; option.selected = choice.id === sessionProgram; programSelect.append(option);
-  }
-  programSelect.addEventListener("change", () => { sessionProgram = programSelect.value; updateSessionResults(results, count); });
-  add(programField, programLabel, programSelect);
-  add(filters, searchField, exerciseField, programField); view.append(filters);
-  const count = node("p", "result-count"); const results = node("div", "panel recent-list"); add(view, count, results); updateSessionResults(results, count);
+  add(view, heading("Workout", "Sessions", "Search every synced workout and open a session for its full set-by-set record.", periodPicker()));
+
+  const panel = node("section", "panel");
+  const header = panelHeader("Sessions", "…");
+  const subtitle = header.querySelector("p");
+  const results = node("div", "recent-list");
+  const update = () => updateSessionResults(results, subtitle);
+
+  const filters = node("div", "filters");
+  const search = field("Search sessions", { type: "search", value: sessionQuery, placeholder: "Workout or exercise" });
+  search.control.addEventListener("input", () => { sessionQuery = search.control.value; update(); });
+
+  const exercise = field("Exercise", {
+    options: [{ value: "all", label: "All exercises" }, ...exerciseChoices().map((choice) => ({ value: choice.id, label: choice.title }))],
+    value: sessionExercise,
+  });
+  exercise.control.addEventListener("change", () => { sessionExercise = exercise.control.value; update(); });
+
+  if (sessionProgram !== "all" && sessionProgram !== "none" && !state.programs.some((program) => program.id === sessionProgram)) sessionProgram = "all";
+  const program = field("Program", {
+    options: [{ value: "all", label: "All programs" }, { value: "none", label: "No program match" }, ...state.programs.map((item) => ({ value: item.id, label: item.title }))],
+    value: sessionProgram,
+  });
+  program.control.addEventListener("change", () => { sessionProgram = program.control.value; update(); });
+
+  add(filters, search, exercise, program);
+  add(view, filters);
+  add(panel, header, results);
+  view.append(panel);
+  update();
   return view;
 }
 
 function matchingSessions() {
   const query = sessionQuery.trim().toLocaleLowerCase();
-  return [...state.workouts].filter((workout) => {
+  return filterByPeriod(state.workouts, analyticsPeriod(getPeriod()), new Date()).filter((workout) => {
     const matchesExercise = sessionExercise === "all" || (workout.exercises || []).some((exercise) => String(exercise.exercise_template_id) === sessionExercise);
     const programs = matchingPrograms(workout, state.programs);
-    const matchesProgram = sessionProgram === "all" || (sessionProgram === "none" ? !programs.length : programs.some(program => program.id === sessionProgram));
+    const matchesProgram = sessionProgram === "all" || (sessionProgram === "none" ? !programs.length : programs.some((program) => program.id === sessionProgram));
     const haystack = [workout.title, ...(workout.exercises || []).map((exercise) => exercise.title)].filter(Boolean).join(" ").toLocaleLowerCase();
     return matchesExercise && matchesProgram && (!query || haystack.includes(query));
   }).sort((a, b) => new Date(b.start_time) - new Date(a.start_time));
 }
 
-function updateSessionResults(results, count) {
-  const workouts = matchingSessions(); count.textContent = `${workouts.length} session${workouts.length === 1 ? "" : "s"}`; results.replaceChildren();
-  if (!workouts.length) { results.append(emptyState("No matching sessions", "Try another search or exercise filter.", "⌕")); return; }
-  const map = templateById(); workouts.forEach((workout) => results.append(sessionRow(workout, map)));
+function updateSessionResults(results, subtitle) {
+  const workouts = matchingSessions();
+  subtitle.textContent = `${plural(workouts.length, "session")} in this range`;
+  results.replaceChildren();
+  if (!workouts.length) {
+    results.append(emptyState({
+      title: "No matching sessions",
+      copy: "Try another search, another filter, or a wider date range.",
+      icon: "⌕",
+      action: getPeriod() === "all" ? null : button("Show all time", { onClick: () => { setPeriod("all"); render(); } }),
+    }));
+    return;
+  }
+  const map = templateById();
+  const displayUnit = unit();
+  workouts.forEach((workout) => results.append(sessionRow(workout, map, displayUnit)));
 }
+
+/* ------------------------------------------------------------------- dialogs */
 
 function openDialog(eyebrow, title, content) {
-  dialogEyebrow.textContent = eyebrow; dialogTitle.textContent = title; dialogBody.replaceChildren(content); dialog.showModal();
+  dialogEyebrow.textContent = eyebrow;
+  dialogTitle.textContent = title;
+  dialogBody.replaceChildren(content);
+  dialog.showModal();
 }
 
-function setDisplay(set) {
-  const cells = [];
-  const weight = Number(set.weight_kg);
-  cells.push(Number.isFinite(weight) && weight > 0 ? `${formatNumber(convertKg(weight), 1)} ${unit()}` : "—");
-  cells.push(set.reps != null && Number.isFinite(Number(set.reps)) ? String(set.reps) : "—");
-  cells.push(set.duration_seconds != null && Number.isFinite(Number(set.duration_seconds)) ? formatDuration(Math.round(set.duration_seconds / 60)) : "—");
-  cells.push(set.distance_meters != null && Number.isFinite(Number(set.distance_meters)) ? `${formatNumber(set.distance_meters)} m` : "—");
-  cells.push(set.rpe != null && Number.isFinite(Number(set.rpe)) ? String(set.rpe) : "—");
-  return cells;
+function setDisplay(set, displayUnit) {
+  return [
+    Number(set.weight_kg) > 0 ? formatLoad(set.weight_kg, displayUnit) : MISSING,
+    set.reps != null ? formatNumber(set.reps) : MISSING,
+    set.duration_seconds != null ? formatSeconds(set.duration_seconds) : MISSING,
+    set.distance_meters != null ? formatNumber(set.distance_meters) : MISSING,
+    set.rpe != null ? formatNumber(set.rpe, 1) : MISSING,
+  ];
 }
 
 function showSession(workout) {
-  const content = node("div"); const meta = node("div", "detail-meta");
-  const volume = add(node("div"), node("span", "", "External volume"), node("strong", "", `${formatVolume(workoutVolume(workout, templateById()))} ${unit()}·reps`));
+  const displayUnit = unit();
+  const content = node("div", "dialog-stack");
+  const meta = node("div", "detail-meta");
+  const volume = add(node("div"), node("span", "", `External volume (${displayUnit}·reps)`), node("strong", "", formatNumber(convertKg(workoutVolume(workout, templateById()), displayUnit))));
   const duration = add(node("div"), node("span", "", "Duration"), node("strong", "", formatDuration(durationMinutes(workout))));
-  const date = add(node("div"), node("span", "", "Started"), node("strong", "", dateLabel(workout.start_time, { dateStyle: "medium", timeStyle: "short" })));
-  add(meta, date, duration, volume); add(content, meta, sessionProgramBadges(workout, true));
+  const date = add(node("div"), node("span", "", "Started"), node("strong", "", formatDateTime(workout.start_time)));
+  add(meta, date, duration, volume);
+  add(content, meta, sessionProgramBadges(workout, true));
   for (const exercise of workout.exercises || []) {
-    const section = node("section", "exercise-detail"); add(section, node("h3", "", exercise.title || "Untitled exercise"));
+    const section = node("section", "exercise-detail");
+    add(section, node("h3", "card-title", exercise.title || "Untitled exercise"));
     if (exercise.notes) section.append(node("p", "exercise-note", exercise.notes));
     const table = node("table", "sets-table");
-    const thead = node("thead"), hr = node("tr"); ["Set", "Load", "Reps", "Time", "Distance", "RPE"].forEach((label) => hr.append(node("th", "", label))); thead.append(hr); table.append(thead);
+    const thead = node("thead"), headRow = node("tr");
+    ["Set", `Load (${displayUnit})`, "Reps", "Time", "Distance (m)", "RPE"].forEach((label) => headRow.append(node("th", "", label)));
+    thead.append(headRow);
+    table.append(thead);
     const tbody = node("tbody");
     (exercise.sets || []).forEach((set, index) => {
-      const row = node("tr"); const first = node("td", "", String(index + 1)); if (set.type && set.type !== "normal") first.append(node("span", "set-type", set.type)); row.append(first);
-      setDisplay(set).forEach((value) => row.append(node("td", "", value))); tbody.append(row);
+      const row = node("tr");
+      const first = node("td", "", String(index + 1));
+      if (set.type && set.type !== "normal") first.append(node("span", "micro-tag", String(set.type).replaceAll("_", " ")));
+      row.append(first);
+      setDisplay(set, displayUnit).forEach((value) => row.append(node("td", "", value)));
+      tbody.append(row);
     });
-    table.append(tbody); section.append(table); content.append(section);
+    table.append(tbody);
+    section.append(table);
+    content.append(section);
   }
-  openDialog("Session detail", workout.title || "Untitled workout", content);
+  content.append(add(node("div", "dialog-actions"), button("Close", { onClick: () => dialog.close() })));
+  openDialog("Session", workout.title || "Untitled workout", content);
 }
+
+/* ----------------------------------------------------------------- exercises */
 
 function renderExercises() {
   const view = node("section", "view section-page");
-  add(view, heading("Movement library", "Exercises", "The exercise templates imported with your Hevy archive."));
-  const searchWrap = node("div", "filters"); const searchField = node("div", "field search-field"); const label = node("label", "", "Search exercises"); label.htmlFor = "exercise-search"; searchField.append(label);
-  const search = node("input", "input"); search.id = "exercise-search"; search.type = "search"; search.placeholder = "Name, muscle or equipment"; searchField.append(search); searchWrap.append(searchField); view.append(searchWrap);
-  const count = node("p", "result-count"); const grid = node("div", "exercise-grid"); add(view, count, grid);
+  add(view, heading("Workout", "Exercises", "The exercise templates imported with your Hevy archive."));
+  const filters = node("div", "filters");
+  const search = field("Search exercises", { type: "search", placeholder: "Name, muscle or equipment" });
+  add(filters, search);
+  const count = node("p", "note");
+  const grid = node("div", "card-grid");
+  add(view, filters, count, grid);
+
   const update = () => {
-    const query = search.value.trim().toLocaleLowerCase();
+    const query = search.control.value.trim().toLocaleLowerCase();
     const templates = state.exerciseTemplates.filter((item) => {
       const secondary = Array.isArray(item.secondary_muscle_groups) ? item.secondary_muscle_groups : [];
       const searchText = [item.title, item.primary_muscle_group, ...secondary, item.equipment]
@@ -504,40 +747,47 @@ function renderExercises() {
         .toLocaleLowerCase();
       return searchText.includes(query);
     });
-    count.textContent = `${templates.length} exercise${templates.length === 1 ? "" : "s"}`; grid.replaceChildren();
-    if (!templates.length) { grid.append(emptyState("No matching exercises", "Try a broader search.", "⌕")); return; }
-    templates.forEach((item) => {
-      const card = node("article", "exercise-card");
-      add(card, node("p", "card-kicker", String(item.type || "exercise").replaceAll("_", " ")), node("h2", "", item.title || "Untitled exercise"));
-
-      const secondary = Array.isArray(item.secondary_muscle_groups) ? item.secondary_muscle_groups : [];
-      const muscles = [];
-      const seenMuscles = new Set();
-      [item.primary_muscle_group, ...secondary].forEach((muscle) => {
-        const value = String(muscle || "").trim();
-        const key = value.replaceAll("_", " ").toLocaleLowerCase();
-        if (value && !seenMuscles.has(key)) { seenMuscles.add(key); muscles.push(value); }
-      });
-      const muscleTags = node("div", "exercise-tags");
-      const primaryMuscle = String(item.primary_muscle_group || "").trim();
-      (muscles.length ? muscles : ["Not specified"]).forEach((muscle) => {
-        const isPrimary = Boolean(primaryMuscle) && muscle === primaryMuscle;
-        muscleTags.append(node("span", isPrimary ? "tag primary-muscle" : "tag", `${titleCase(muscle)}${isPrimary ? " · Primary" : ""}`));
-      });
-      const muscleGroup = node("div", "exercise-attribute");
-      add(muscleGroup, node("p", "exercise-label", "Muscle groups"), muscleTags);
-
-      const equipmentTags = node("div", "exercise-tags");
-      equipmentTags.append(node("span", "tag", item.equipment ? titleCase(item.equipment) : "Not specified"));
-      const equipmentGroup = node("div", "exercise-attribute");
-      add(equipmentGroup, node("p", "exercise-label", "Equipment"), equipmentTags);
-      card.append(muscleGroup, equipmentGroup); grid.append(card);
-    });
+    count.textContent = plural(templates.length, "exercise");
+    grid.replaceChildren();
+    if (!templates.length) {
+      grid.append(emptyState({ title: "No matching exercises", copy: "Try a broader search.", icon: "⌕" }));
+      return;
+    }
+    templates.forEach((item) => grid.append(exerciseCard(item)));
   };
-  search.addEventListener("input", update); update(); return view;
+  search.control.addEventListener("input", update);
+  update();
+  return view;
 }
 
-function titleCase(value) { return String(value || "").replaceAll("_", " ").replace(/\b\w/g, (letter) => letter.toUpperCase()); }
+function exerciseCard(item) {
+  const card = node("article", "card exercise-card");
+  add(card, node("p", "label-caps", exerciseKind(item.type)), node("h3", "card-title", item.title || "Untitled exercise"));
+
+  const secondary = Array.isArray(item.secondary_muscle_groups) ? item.secondary_muscle_groups : [];
+  const muscles = [];
+  const seen = new Set();
+  [item.primary_muscle_group, ...secondary].forEach((muscle) => {
+    const value = String(muscle || "").trim();
+    const key = value.replaceAll("_", " ").toLocaleLowerCase();
+    if (value && !seen.has(key)) { seen.add(key); muscles.push(value); }
+  });
+  const primary = String(item.primary_muscle_group || "").trim();
+  const muscleTags = node("div", "exercise-tags");
+  (muscles.length ? muscles : [NOT_SET]).forEach((muscle) => {
+    const isPrimary = Boolean(primary) && muscle === primary;
+    muscleTags.append(node("span", "pill pill--neutral", `${muscle === NOT_SET ? NOT_SET : titleCase(muscle)}${isPrimary ? " · Primary" : ""}`));
+  });
+  const equipmentTags = node("div", "exercise-tags");
+  equipmentTags.append(node("span", "pill pill--neutral", item.equipment ? titleCase(item.equipment) : NOT_SET));
+  add(card,
+    add(node("div", "exercise-attribute"), node("p", "label-caps", "Muscle groups"), muscleTags),
+    add(node("div", "exercise-attribute"), node("p", "label-caps", "Equipment"), equipmentTags),
+  );
+  return card;
+}
+
+/* -------------------------------------------------------------------- shell */
 
 function context() {
   return {
@@ -549,19 +799,55 @@ function context() {
     toast,
     openDialog,
     closeDialog: () => dialog.close(),
+    heading,
+    panelHeader,
+    sectionHeading,
+    emptyState,
+    statCard,
+    miniMetric,
+    periodPicker,
+    field,
+    button,
+    settingsLink,
+    setBusy,
+    demoNotice,
+    setMode,
+    syncAll,
+    titleCase,
+    sessionRow,
+    format: {
+      MISSING, NOT_SET, NEVER_SYNCED, MISSING_ROUTINE,
+      formatNumber, formatCompact, formatDuration, formatSeconds, formatDay,
+      formatDateTime, dateLabel, formatLoad, formatSet, convertKg, plural,
+    },
+    period: {
+      list: PERIODS,
+      get: getPeriod,
+      set: setPeriod,
+      label: periodLabel,
+      days: periodDays,
+      weeks: periodWeeks,
+      analytics: analyticsPeriod,
+    },
   };
 }
 
 function updateChrome() {
   const live = state.mode === "live";
+  const mode = live ? "live" : "demo";
   modeBadge.classList.toggle("live", live);
-  modeBadge.replaceChildren(node("span"), document.createTextNode(live ? "Live Hevy data" : "Demo data"));
+  modeBadge.replaceChildren(node("span"), document.createTextNode(MODE_COPY.badge[mode]));
   modeToggle.hidden = false;
-  modeToggle.textContent = live ? "View demo" : "Use my data";
-  syncButton.disabled = false;
-  syncButton.title = state.settings.hasApiKey ? "Sync your Hevy archive" : "Add your Hevy API key in Settings to sync";
-  document.querySelectorAll("[data-route]").forEach((link) => link.classList.toggle("is-active", link.dataset.route === route()));
-  document.querySelectorAll(".nav-group").forEach((group) => { if (group.querySelector(`[data-route="${route()}"]`)) group.open = true; });
+  modeToggle.textContent = MODE_COPY.toggle[mode];
+  const connected = Boolean(state.settings?.hasApiKey) || Boolean(state.settings?.googleHealth?.connected);
+  if (syncButton) syncButton.title = connected ? "Sync your connected data sources" : "Connect a data source in Settings to sync";
+  const current = route();
+  document.querySelectorAll("[data-route]").forEach((link) => {
+    const active = link.dataset.route === current;
+    link.classList.toggle("is-active", active);
+    if (active) link.setAttribute("aria-current", "page"); else link.removeAttribute("aria-current");
+  });
+  document.querySelectorAll(".nav-group").forEach((group) => { if (group.querySelector(`[data-route="${current}"]`)) group.open = true; });
   const badge = document.querySelector("#proposals-badge");
   const count = pendingCount(state.proposals || []);
   if (badge) { badge.textContent = count ? String(count) : ""; badge.hidden = !count; }
@@ -580,9 +866,10 @@ function syncProposalPolling() {
 
 function render() {
   if (!state) return;
+  const current = route();
   updateChrome();
   let view;
-  switch (route()) {
+  switch (current) {
     case "sessions": view = renderSessions(); break;
     case "programs": view = renderProgramsModule(context()); break;
     case "proposals": view = renderProposals(context()); break;
@@ -592,7 +879,14 @@ function render() {
     case "settings": view = renderSettingsModule(context()); break;
     default: view = renderOverview();
   }
+  // The view transition belongs to a route change, not to an in-page filter.
+  if (current !== lastRoute) view.classList.add("is-entering");
+  lastRoute = current;
   root.replaceChildren(view);
+  if (state.mode === "demo") {
+    const header = view.querySelector(".view-header");
+    if (header) header.after(demoNotice()); else view.prepend(demoNotice());
+  }
   root.hidden = false;
   loading.hidden = true;
   closeMenu();
@@ -637,39 +931,23 @@ window.addEventListener("focus", syncProposalPolling);
 document.addEventListener("visibilitychange", syncProposalPolling);
 document.querySelector(".dialog-close").addEventListener("click", () => dialog.close());
 dialog.addEventListener("click", (event) => { if (event.target === dialog) dialog.close(); });
+dialog.addEventListener("close", () => dialogBody.replaceChildren());
 
-syncButton.addEventListener("click", async () => {
-  if (!state.settings.hasApiKey) {
-    location.hash = "#settings";
-    toast("Add your Hevy API key", "Save it locally in Settings before syncing.", "error");
-    return;
-  }
-  setBusy(syncButton, true);
-  try { await api("/api/sync", { method: "POST", body: "{}" }); await loadState(); toast("Hevy sync complete", "Your local archive is up to date."); }
-  catch (error) { toast("Hevy sync failed", error.message, "error"); }
-  finally { setBusy(syncButton, false); }
-});
+syncButton?.addEventListener("click", () => { syncAll(); });
+modeToggle.addEventListener("click", () => { setMode(state.mode !== "demo"); });
 
-exportButton.addEventListener("click", async () => {
-  setBusy(exportButton, true);
-  try {
-    const result = await api("/api/export", { method: "POST", body: "{}" });
-    const files = Array.isArray(result.files) ? result.files : [];
-    toast("Markdown export ready", files.length ? `${files.length} file${files.length === 1 ? "" : "s"} written locally.` : "Export completed.");
-  } catch (error) { toast("Export failed", error.message, "error"); }
-  finally { setBusy(exportButton, false); }
-});
-
-modeToggle.addEventListener("click", async () => {
-  const enableDemo = state.mode !== "demo";
-  setBusy(modeToggle, true);
-  try { await api("/api/demo", { method: "POST", body: JSON.stringify({ enabled: enableDemo }) }); await loadState(); toast(enableDemo ? "Demo mode on" : "Live mode on", enableDemo ? "You’re viewing sample training data." : "Your local Hevy archive is active."); }
-  catch (error) { toast("Couldn’t switch data mode", error.message, "error"); }
-  finally { setBusy(modeToggle, false); }
-});
+function startup() {
+  return loadState().catch((error) => {
+    loading.hidden = false;
+    loading.replaceChildren(emptyState({
+      title: "Corpus couldn’t load",
+      copy: error.message || "Check that the local server is running.",
+      icon: "!",
+      action: button("Try again", { variant: "primary", onClick: () => { loading.replaceChildren(node("span", "loader"), node("p", "", "Opening your training archive…")); startup(); } }),
+    }));
+    toast("Couldn’t load your archive", error.message || "Check that the local server is running.", "error");
+  });
+}
 
 if (!location.hash) history.replaceState(null, "", "#overview");
-loadState().catch((error) => {
-  loading.replaceChildren(emptyState("Corpus couldn’t load", error.message || "Check that the local server is running.", "!"));
-  toast("Couldn’t load your archive", error.message, "error");
-});
+startup();

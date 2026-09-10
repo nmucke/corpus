@@ -1,34 +1,36 @@
 // Metrics views: the health Dashboard (#metrics) and Trends (#metrics-trends).
-// Both fetch /api/metrics through the shared api helper, cache the last
-// response per (mode, days), and fill their panels asynchronously.
+// Both are built entirely on the shared helpers from `context()` (heading,
+// periodPicker, statCard, panelHeader, emptyState, miniMetric, format, period).
+//
+// Fetching: the widest window (MAX_FETCH_DAYS) is fetched once per data mode
+// and cached, then every range is sliced client-side by metrics-analytics.js.
+// A range change is therefore instant — the body never collapses to a loader.
 
 import { CATEGORIES, METRICS, isMetricKey, metricByKey, metricsInCategory } from './metrics-catalog.js';
 import { localDateKey } from './program-timeline.js';
-import { dateRange, fillDays, periodDays, previousRange, rollingMean, sleepStack, summarize, trainingDaySplit } from './metrics-analytics.js';
-import { barChart, formatMinutes, formatValue, labelDate, lineChart, stackedBarChart } from './metric-charts.js';
+import { dateRange, fillDays, previousRange, rollingMean, sleepStack, summarize, trainingDaySplit } from './metrics-analytics.js';
+import { barChart, lineChart, mountChart, stackedBarChart } from './metric-charts.js';
 
-const PERIODS = [['4w', '4 weeks'], ['12w', '12 weeks'], ['26w', '26 weeks'], ['1y', '1 year']];
-const LB_PER_KG = 2.2046226218;
+/** The widest window the server will serve, and what `All` means here (D10). */
 const MAX_FETCH_DAYS = 730;
 
-let period = '12w';
 let trendMetric = 'steps';
 let cache = { key: null, data: null };
 let inflight = { key: null, promise: null };
 
-function cacheKey(ctx, days) { return `${ctx.state?.mode || 'demo'}:${days}`; }
+function cacheKey(ctx) { return ctx.state?.mode || 'demo'; }
 
-/** Returns the cached response for (mode, days) or null. */
-export function cachedMetrics(ctx, days) { return cache.key === cacheKey(ctx, days) ? cache.data : null; }
+/** Returns the cached response for the current data mode, or null. */
+export function cachedMetrics(ctx) { return cache.key === cacheKey(ctx) ? cache.data : null; }
 
 export function invalidateMetrics() { cache = { key: null, data: null }; }
 
-/** Fetches `/api/metrics?days=N`, de-duplicating concurrent requests and caching the last response. */
-export async function loadMetrics(ctx, days) {
-  const key = cacheKey(ctx, days);
+/** Fetches the widest window, de-duplicating concurrent requests and caching the response. */
+export async function loadMetrics(ctx) {
+  const key = cacheKey(ctx);
   if (cache.key === key && cache.data) return cache.data;
   if (inflight.key !== key) {
-    const promise = ctx.api(`/api/metrics?days=${days}`)
+    const promise = ctx.api(`/api/metrics?days=${MAX_FETCH_DAYS}`)
       .then((data) => { cache = { key, data: normalize(data) }; return cache.data; })
       .finally(() => { if (inflight.key === key) inflight = { key: null, promise: null }; });
     inflight = { key, promise };
@@ -42,18 +44,15 @@ function normalize(data) {
   return { ...data, sources: Array.isArray(data?.sources) ? data.sources : [], series, range: data?.range || {} };
 }
 
-// The current window plus the one before it, so change indicators have a baseline.
-function fetchDays(days) { return Math.min(MAX_FETCH_DAYS, days * 2); }
+/* ------------------------------------------------------------------ windows */
 
-function periodLabel(value) { return (PERIODS.find(([key]) => key === value) || PERIODS[1])[1]; }
+function rangeDays(ctx) { return ctx.period.days(ctx.period.get()) ?? MAX_FETCH_DAYS; }
 
-function todayKey() { return localDateKey(new Date()); }
-
-function windows(data) {
-  const days = periodDays(period);
-  const to = data.range?.to || todayKey();
-  const current = dateRange(to, days);
-  return { days, current, previous: previousRange(current.from, current.to) };
+/** The selected window plus the one before it, so deltas have a baseline. */
+function windows(ctx, data) {
+  const to = data.range?.to || localDateKey(new Date());
+  const current = dateRange(to, rangeDays(ctx));
+  return { current, previous: previousRange(current.from, current.to) };
 }
 
 function workoutDates(state) {
@@ -65,6 +64,8 @@ function workoutDates(state) {
   return dates;
 }
 
+/* --------------------------------------------------------------- formatting */
+
 function displayUnit(ctx, metric) {
   if (metric.unit === 'kg') return ctx.state.settings?.unit === 'lb' ? 'lb' : 'kg';
   return metric.unit;
@@ -72,229 +73,286 @@ function displayUnit(ctx, metric) {
 
 function displaySeries(ctx, metric, data) {
   const series = data.series[metric.key] || [];
-  if (metric.unit !== 'kg' || displayUnit(ctx, metric) !== 'lb') return series;
-  return series.map((point) => ({ ...point, value: point.value == null ? null : Number(point.value) * LB_PER_KG }));
+  if (metric.unit !== 'kg') return series;
+  const unit = displayUnit(ctx, metric);
+  if (unit !== 'lb') return series;
+  return series.map((point) => ({ ...point, value: ctx.format.convertKg(point.value, 'lb') }));
 }
 
-function formatterFor(metric, unit) {
-  if (metric.category === 'sleep') return (value) => formatMinutes(value);
-  return (value) => (value == null ? '—' : `${formatValue(value, metric.decimals)} ${unit}`.trim());
+/** Tooltip and chip voice: the number with its unit. */
+function valueFormat(ctx, metric, unit) {
+  const { formatDuration, formatNumber, MISSING } = ctx.format;
+  if (metric.category === 'sleep') return (value) => formatDuration(value);
+  return (value) => (value == null ? MISSING : `${formatNumber(value, metric.decimals)} ${unit}`.trim());
+}
+
+/** Table voice: the bare number — the unit is in the column header (D21). */
+function cellFormat(ctx, metric) {
+  const { formatDuration, formatNumber } = ctx.format;
+  if (metric.category === 'sleep') return (value) => formatDuration(value);
+  return (value) => formatNumber(value, metric.decimals);
+}
+
+/** Chart axes are the one place large numbers abbreviate (D21). */
+function axisFormat(ctx, metric, points) {
+  const { formatCompact, formatDuration, formatNumber } = ctx.format;
+  if (metric.category === 'sleep') return (value) => formatDuration(value);
+  const max = Math.max(0, ...points.map((point) => Math.abs(point.value ?? 0)));
+  return max >= 10000 ? formatCompact : (value) => formatNumber(value, metric.decimals);
+}
+
+/** A column header carries the unit unless the metric label already does. */
+function columnLabel(metric, unit) {
+  if (metric.category === 'sleep' || metric.unit === 'steps') return metric.label;
+  return `${metric.label} (${unit})`;
+}
+
+/** `Jun 19 – Sep 10`, with the year once a window crosses one. */
+function rangeLabel(ctx, range) {
+  const options = String(range.from).slice(0, 4) === String(range.to).slice(0, 4)
+    ? { month: 'short', day: 'numeric' }
+    : { year: 'numeric', month: 'short', day: 'numeric' };
+  return `${ctx.format.formatDay(range.from, options)} – ${ctx.format.formatDay(range.to, options)}`;
 }
 
 function hasData(data, key) { return (data.series[key] || []).length > 0; }
+function noSeriesData(data) { return METRICS.every((metric) => !hasData(data, metric.key)); }
 
 function connectedSource(ctx, data) {
   return ctx.state.mode === 'demo' || Boolean(ctx.state.settings?.googleHealth?.connected) || data.sources.length > 0;
 }
 
-function button(node, className, text) {
-  const control = node('button', `button ${className}`, text);
-  control.type = 'button';
-  return control;
-}
+/* ------------------------------------------------------------------- panels */
 
-function viewHeader(ctx, title, description, ...actions) {
+function panel(ctx, ...children) { return ctx.add(ctx.node('section', 'panel'), ...children); }
+
+function loadingPanel(ctx) {
   const { node, add } = ctx;
-  const header = node('header', 'view-header');
-  const copy = node('div', 'view-heading');
-  add(copy, node('p', 'eyebrow', 'Health metrics'), node('h1', '', title), node('p', '', description));
-  const controls = node('div', 'metrics-actions');
-  add(controls, ...actions);
-  add(header, copy, controls);
-  return header;
+  const status = node('div', 'loading-block');
+  status.setAttribute('role', 'status');
+  add(status, node('span', 'loader'), node('p', '', 'Loading health metrics…'));
+  return panel(ctx, status);
 }
 
-function periodPicker(ctx, onChange) {
-  const { node } = ctx;
-  const picker = node('div', 'period-picker');
-  picker.setAttribute('aria-label', 'Date range');
-  for (const [value, label] of PERIODS) {
-    const control = node('button', '', label);
-    control.type = 'button';
-    control.dataset.period = value;
-    control.setAttribute('aria-pressed', String(value === period));
-    control.addEventListener('click', () => { if (period !== value) { period = value; onChange(); } });
-    picker.append(control);
-  }
-  return picker;
+function failurePanel(ctx, error, retry) {
+  return panel(ctx, ctx.emptyState({
+    title: 'Couldn’t load metrics',
+    copy: error.message || 'Check that the local server is still running.',
+    icon: '!',
+    action: ctx.button('Try again', { variant: 'secondary', onClick: retry }),
+  }));
 }
 
-function syncButton(ctx, view) {
-  const { node, add, api, refresh, toast, state } = ctx;
-  const control = button(node, 'secondary', '');
-  add(control, node('span', 'sync-icon', '↻'), node('span', '', 'Sync Google Health'));
-  const connected = Boolean(state.settings?.googleHealth?.connected);
-  control.disabled = !connected;
-  control.title = connected ? 'Import the latest Google Health data' : 'Connect Google Health in Settings to sync';
-  control.addEventListener('click', async () => {
-    control.disabled = true;
-    control.classList.add('syncing');
-    try {
-      const result = await api('/api/metrics/sync', { method: 'POST', body: '{}' });
-      invalidateMetrics();
-      const imported = Number(result?.imported) || 0;
-      const warnings = Array.isArray(result?.warnings) ? result.warnings.filter(Boolean) : [];
-      await refresh();
-      const summary = `${formatValue(imported)} data point${imported === 1 ? '' : 's'} imported.`;
-      toast(warnings.length ? 'Google Health sync finished with warnings' : 'Google Health sync complete', warnings.length ? `${summary} ${warnings.join(' ')}` : summary);
-    } catch (error) {
-      toast('Google Health sync failed', error.message || 'Please try again.', 'error');
-    } finally {
-      if (view.isConnected) { control.disabled = !connected; control.classList.remove('syncing'); }
-    }
+/** Imports the latest Google Health data straight from the empty state (D1: no header sync). */
+function syncNowButton(ctx) {
+  const control = ctx.button('Sync now', {
+    variant: 'secondary',
+    icon: '↻',
+    title: 'Import the latest Google Health data',
+    onClick: async () => {
+      ctx.setBusy(control, true);
+      try {
+        const result = await ctx.api('/api/metrics/sync', { method: 'POST', body: '{}' });
+        invalidateMetrics();
+        const imported = Number(result?.imported) || 0;
+        const warnings = Array.isArray(result?.warnings) ? result.warnings.filter(Boolean) : [];
+        const demo = (result?.mode || ctx.state.mode) === 'demo';
+        await ctx.refresh();
+        const extra = [...warnings];
+        if (demo) extra.push('Switch to live data to see the changes.');
+        ctx.toast('Google Health synced', [`${ctx.format.plural(imported, 'data point')} imported.`, ...extra].join(' '));
+      } catch (error) {
+        ctx.toast('Couldn’t sync Google Health', error.message || 'Please try again.', 'error');
+      } finally {
+        if (control.isConnected) ctx.setBusy(control, false);
+      }
+    },
   });
   return control;
 }
 
-function loader(ctx, text) {
-  const { node, add } = ctx;
-  const panel = node('section', 'panel');
-  const status = node('div', 'metrics-loading');
-  status.setAttribute('role', 'status');
-  add(status, node('span', 'loader'), node('p', '', text));
-  panel.append(status);
-  return panel;
-}
-
-function emptyState(ctx, title, copy, icon = '○', action = null) {
-  const { node, add } = ctx;
-  const empty = node('div', 'empty-state');
-  add(empty, node('div', 'empty-state-icon', icon), node('h2', '', title), node('p', '', copy), action);
-  return empty;
-}
-
-function panelHeader(ctx, title, subtitle, extra) {
-  const { node, add } = ctx;
-  const header = node('header', 'panel-header');
-  const copy = node('div');
-  add(copy, node('h2', '', title), subtitle ? node('p', '', subtitle) : null);
-  add(header, copy, extra);
-  return header;
-}
-
-function settingsLink(node, text = 'Open settings') {
-  const link = node('a', 'button secondary', text);
-  link.href = '#settings';
-  return link;
-}
-
+/** Nothing to show: either the source is not connected, or it has never synced. */
 function sourceEmptyState(ctx, data) {
   if (!connectedSource(ctx, data)) {
-    return emptyState(ctx, 'Connect Google Health', 'Add your Google OAuth client in Settings and connect your account to import steps, heart, sleep, and body metrics.', '∿', settingsLink(ctx.node));
+    return ctx.emptyState({
+      title: 'Connect Google Health',
+      copy: 'Add your Google OAuth client in Settings and connect your account to import steps, heart, sleep and body metrics.',
+      icon: '∿',
+      action: ctx.settingsLink('Open Settings', { asButton: true }),
+    });
   }
-  return emptyState(ctx, 'Sync to load your metrics', ctx.state.mode === 'demo' ? 'No demo metrics were generated for this range.' : 'Use “Sync Google Health” above to import your recent health data.', '↻');
-}
-
-function noSeriesData(data) { return METRICS.every((metric) => !hasData(data, metric.key)); }
-
-/** Renders a view now, then swaps in fresh data when it arrives. */
-function loadInto(ctx, view, body, days, fill) {
-  const cached = cachedMetrics(ctx, days);
-  if (cached) { fill(cached); return; }
-  body.replaceChildren(loader(ctx, 'Loading health metrics…'));
-  loadMetrics(ctx, days).then((data) => {
-    if (!view.isConnected) return;
-    fill(data);
-  }).catch((error) => {
-    if (!view.isConnected) return;
-    const panel = ctx.node('section', 'panel');
-    panel.append(emptyState(ctx, 'Couldn’t load metrics', error.message || 'Check that the local server is running.', '!'));
-    body.replaceChildren(panel);
-    ctx.toast('Couldn’t load metrics', error.message || 'Please try again.', 'error');
+  return ctx.emptyState({
+    title: 'Sync to load your metrics',
+    copy: ctx.state.mode === 'demo'
+      ? 'No demo metrics were generated for this archive. Sync to import your own Google Health data instead.'
+      : 'Import your recent steps, heart, sleep and body data from Google Health.',
+    icon: '↻',
+    action: syncNowButton(ctx),
   });
 }
 
-/** Change indicator plus its comparison text; changes that round to zero read as flat. */
-function delta(ctx, change, format, decimals) {
-  const { node } = ctx;
-  if (change == null) return node('span', 'stat-delta flat', 'no previous window');
-  const rounded = Number(change.toFixed(decimals));
-  if (rounded === 0) return node('span', 'stat-delta flat', `no change vs previous ${periodLabel(period)}`);
-  const up = rounded > 0;
-  const span = node('span', `stat-delta ${up ? 'up' : 'down'}`, `${up ? '▲' : '▼'} ${format(Math.abs(rounded))}`);
-  span.setAttribute('aria-label', `${up ? 'Up' : 'Down'} ${format(Math.abs(rounded))}`);
-  return [span, document.createTextNode(` vs previous ${periodLabel(period)}`)];
-}
-
-function statCard(ctx, label, value, change, format, decimals, suffix = '') {
-  const { node, add } = ctx;
-  const note = node('p', 'stat-note');
-  add(note, delta(ctx, change, format, decimals), suffix ? document.createTextNode(` · ${suffix}`) : null);
-  return add(node('article', 'stat-card'), node('p', 'stat-label', label), node('p', 'stat-value', value), note);
-}
-
-// Dashboard chart cards: one metric per panel with a "Category · unit" subtitle.
-const CHART_NOTES = {
+// Panel subtitles are scope metadata: "<category> · <what one mark covers>".
+const CHART_SCOPE = {
   steps: () => 'steps per day',
   active_zone_minutes: () => 'minutes per day',
-  sleep_minutes: () => 'time asleep per night, dated by the morning you woke up',
+  sleep_minutes: () => 'per night, by stage',
   weight_kg: (unit) => `${unit} with 7-day mean`,
 };
 
-function chartPanel(ctx, metric, unit, chart) {
-  const { node, add } = ctx;
+function chartSubtitle(metric, unit) {
   const category = CATEGORIES.find((entry) => entry.key === metric.category)?.label || metric.category;
-  const note = (CHART_NOTES[metric.key] || ((value) => value))(unit);
-  return add(node('section', 'panel metric-panel'), panelHeader(ctx, metric.label, `${category} · ${note}`), chart);
+  return `${category} · ${(CHART_SCOPE[metric.key] || ((value) => `${value} per day`))(unit)}`;
 }
 
-function rerender(view, next) { if (view.isConnected) view.replaceWith(next); }
+/**
+ * A titled panel holding one chart. `build({ compact })` is called by
+ * `mountChart`, which picks the geometry from the measured container — the
+ * call site never passes `compact` (D12).
+ */
+function chartPanel(ctx, title, subtitle, build) {
+  const { node } = ctx;
+  const mount = node('div', 'chart-mount');
+  mountChart(mount, build);
+  return panel(ctx, ctx.panelHeader(title, subtitle), mount);
+}
 
-export function renderMetricsDashboard(ctx) {
-  const { node, add, state } = ctx;
-  const view = node('section', 'view section-page metrics-view');
-  const body = node('div', 'metrics-body');
-  add(view, viewHeader(ctx, 'Dashboard', 'Daily activity, heart, sleep, and body metrics alongside your training days.', periodPicker(ctx, () => rerender(view, renderMetricsDashboard(ctx))), syncButton(ctx, view)), body);
-  const days = periodDays(period);
-  loadInto(ctx, view, body, fetchDays(days), (data) => {
-    body.replaceChildren();
-    if (noSeriesData(data)) { const panel = node('section', 'panel'); panel.append(sourceEmptyState(ctx, data)); body.append(panel); return; }
-    const { current, previous } = windows(data);
-    const markers = workoutDates(state);
-    const filled = (metric) => fillDays(displaySeries(ctx, metric, data), current.from, current.to);
-    const previousFilled = (metric) => fillDays(displaySeries(ctx, metric, data), previous.from, previous.to);
+/* ------------------------------------------------------------ view plumbing */
 
-    const stepsMetric = metricByKey('steps'), hrMetric = metricByKey('resting_hr'), sleepMetric = metricByKey('sleep_minutes'), weightMetric = metricByKey('weight_kg');
-    const stepsFilled = filled(stepsMetric), hrFilled = filled(hrMetric), sleepFilled = filled(sleepMetric), weightFilled = filled(weightMetric);
-    const steps = summarize(stepsFilled, previousFilled(stepsMetric));
-    const hr = summarize(hrFilled, previousFilled(hrMetric));
-    const sleep = summarize(sleepFilled, previousFilled(sleepMetric));
-    const weight = summarize(weightFilled, previousFilled(weightMetric));
-    const weightUnit = displayUnit(ctx, weightMetric);
-    const stats = node('div', 'stat-grid');
-    add(stats,
-      statCard(ctx, 'Steps per day', steps.mean == null ? '—' : formatValue(steps.mean), steps.change, (value) => formatValue(value), 0),
-      statCard(ctx, 'Resting heart rate', hr.mean == null ? '—' : `${formatValue(hr.mean)} bpm`, hr.change, (value) => `${formatValue(value)} bpm`, 0),
-      statCard(ctx, 'Sleep per night', sleep.mean == null ? '—' : formatMinutes(sleep.mean), sleep.change, (value) => formatMinutes(value), 0),
-      statCard(ctx, 'Weight', weight.latest == null ? '—' : `${formatValue(weight.latest, 1)} ${weightUnit}`, weight.change, (value) => `${formatValue(value, 1)} ${weightUnit}`, 1, weight.latestDate ? `latest ${labelDate(weight.latestDate)}` : ''),
-    );
-    body.append(stats);
+/** Keeps the picker's pressed state in sync when only the body re-renders. */
+function markPeriod(picker, value) {
+  for (const control of picker.querySelectorAll('button')) {
+    control.setAttribute('aria-pressed', String(control.dataset.period === value));
+  }
+}
 
-    const grid = node('div', 'dashboard-grid metrics-grid');
-    const card = (metric, build) => {
-      const points = filled(metric);
-      if (!points.some((point) => point.value != null)) return null;
-      const unit = displayUnit(ctx, metric);
-      const options = { points, unit, label: `${metric.label} by day`, decimals: metric.decimals, markers, compact: true, format: formatterFor(metric, unit) };
-      return chartPanel(ctx, metric, unit, build(options));
-    };
-    const line = (metric) => card(metric, lineChart);
-    const bars = (metric) => card(metric, barChart);
-    const stack = sleepStack(data.series, current.from, current.to);
-    const sleepCard = stack.some((row) => row.total != null)
-      ? chartPanel(ctx, sleepMetric, 'min', stackedBarChart({ rows: stack, unit: 'min', label: 'Sleep stages by night', markers, compact: true }))
-      : null;
-    const weightCard = card(weightMetric, (options) => lineChart({ ...options, mean: rollingMean(options.points), label: 'Weight by day with 7-day mean' }));
-    add(grid,
-      bars(stepsMetric), line(hrMetric), sleepCard, line(metricByKey('hrv_ms')), weightCard,
-      hasData(data, 'body_fat_pct') ? line(metricByKey('body_fat_pct')) : null,
-      hasData(data, 'vo2max') ? line(metricByKey('vo2max')) : null,
-      bars(metricByKey('active_zone_minutes')),
-    );
-    body.append(grid);
-  });
+/**
+ * Fills `body` from cache when possible. On a first paint it shows a loader
+ * panel; on a range change it keeps the rendered body, reserves its height and
+ * dims it until the data lands, so the page never collapses (DASH-8).
+ */
+function loadBody(ctx, view, body, fill) {
+  const cached = cachedMetrics(ctx);
+  if (cached) { fill(cached); return; }
+  if (body.childElementCount) {
+    body.style.minHeight = `${body.offsetHeight}px`;
+    body.setAttribute('aria-busy', 'true');
+    body.classList.add('is-refreshing');
+  } else {
+    body.replaceChildren(loadingPanel(ctx));
+  }
+  const settle = () => {
+    body.style.minHeight = '';
+    body.removeAttribute('aria-busy');
+    body.classList.remove('is-refreshing');
+  };
+  loadMetrics(ctx)
+    .then((data) => { if (!view.isConnected) return; settle(); fill(data); })
+    .catch((error) => {
+      if (!view.isConnected) return;
+      settle();
+      body.replaceChildren(failurePanel(ctx, error, () => loadBody(ctx, view, body, fill)));
+      ctx.toast('Couldn’t load metrics', error.message || 'Please try again.', 'error');
+    });
+}
+
+/** The shell both metrics views share: heading + a `.panel-stack` body. */
+function metricsView(ctx, title, description, buildBody, extraActions = []) {
+  const { node, add } = ctx;
+  const view = node('section', 'view section-page');
+  const body = node('div', 'panel-stack');
+  const fill = (data) => body.replaceChildren(...buildBody(ctx, data));
+  const picker = ctx.periodPicker((value) => { markPeriod(picker, value); loadBody(ctx, view, body, fill); });
+  add(view, ctx.heading('Metrics', title, description, ...extraActions, picker), body);
+  loadBody(ctx, view, body, fill);
   return view;
 }
+
+/* ---------------------------------------------------------------- dashboard */
+
+function dashboardBody(ctx, data) {
+  const { node, add, state } = ctx;
+  const { formatDay, formatDuration, formatNumber } = ctx.format;
+  if (noSeriesData(data)) return [panel(ctx, sourceEmptyState(ctx, data))];
+
+  const { current, previous } = windows(ctx, data);
+  const markers = workoutDates(state);
+  const filled = (metric) => fillDays(displaySeries(ctx, metric, data), current.from, current.to);
+  const previousFilled = (metric) => fillDays(displaySeries(ctx, metric, data), previous.from, previous.to);
+  const window = (metric) => summarize(filled(metric), previousFilled(metric));
+
+  const stepsMetric = metricByKey('steps');
+  const hrMetric = metricByKey('resting_hr');
+  const sleepMetric = metricByKey('sleep_minutes');
+  const weightMetric = metricByKey('weight_kg');
+  const steps = window(stepsMetric);
+  const hr = window(hrMetric);
+  const sleep = window(sleepMetric);
+  const weight = window(weightMetric);
+  const weightUnit = displayUnit(ctx, weightMetric);
+
+  const stats = node('div', 'stat-grid');
+  add(stats,
+    ctx.statCard('Steps per day', formatNumber(steps.mean), { change: steps.change }),
+    ctx.statCard('Resting heart rate (bpm)', formatNumber(hr.mean), { change: hr.change }),
+    ctx.statCard('Sleep per night', formatDuration(sleep.mean), { change: sleep.change, format: (value) => formatDuration(value) }),
+    ctx.statCard(`Weight (${weightUnit})`, formatNumber(weight.latest, 1), {
+      change: weight.change,
+      format: (value) => formatNumber(value, 1),
+      decimals: 1,
+      suffix: weight.latestDate ? `latest ${formatDay(weight.latestDate)}` : '',
+    }),
+  );
+
+  const card = (metric, build) => {
+    const points = filled(metric);
+    if (!points.some((point) => point.value != null)) return null;
+    const unit = displayUnit(ctx, metric);
+    const options = {
+      points,
+      unit,
+      label: `${metric.label} by day`,
+      decimals: metric.decimals,
+      markers,
+      format: valueFormat(ctx, metric, unit),
+      axisFormat: axisFormat(ctx, metric, points),
+    };
+    return chartPanel(ctx, metric.label, chartSubtitle(metric, unit), ({ compact }) => build({ ...options, compact }));
+  };
+  const line = (metric) => card(metric, lineChart);
+  const bars = (metric) => card(metric, barChart);
+
+  const stack = sleepStack(data.series, current.from, current.to);
+  const sleepCard = stack.some((row) => row.total != null)
+    ? chartPanel(ctx, sleepMetric.label, chartSubtitle(sleepMetric, 'min'), ({ compact }) => stackedBarChart({
+      rows: stack, unit: 'min', label: 'Sleep stages by night', markers, compact,
+    }))
+    : null;
+  const weightCard = card(weightMetric, (options) => lineChart({
+    ...options,
+    mean: rollingMean(options.points),
+    label: `Weight by day with 7-day mean in ${weightUnit}`,
+  }));
+
+  const grid = node('div', 'metrics-grid');
+  add(grid,
+    bars(stepsMetric), line(hrMetric), sleepCard, line(metricByKey('hrv_ms')), weightCard,
+    hasData(data, 'body_fat_pct') ? line(metricByKey('body_fat_pct')) : null,
+    hasData(data, 'vo2max') ? line(metricByKey('vo2max')) : null,
+    bars(metricByKey('active_zone_minutes')),
+  );
+  return [stats, grid];
+}
+
+export function renderMetricsDashboard(ctx) {
+  return metricsView(
+    ctx,
+    'Dashboard',
+    'Daily activity, heart, sleep and body metrics alongside your training days.',
+    dashboardBody,
+  );
+}
+
+/* ------------------------------------------------------------------- trends */
 
 function metricSelect(ctx, onChange) {
   const { node } = ctx;
@@ -320,69 +378,86 @@ function trendsHashKey() {
   return isMetricKey(key) ? key : null;
 }
 
+function summaryPanel(ctx, stats, split, current, format) {
+  const { node, add } = ctx;
+  const { formatDay } = ctx.format;
+  const row = node('div', 'trend-stats');
+  add(row,
+    ctx.miniMetric(stats.latestDate ? `Latest · ${formatDay(stats.latestDate)}` : 'Latest', format(stats.latest)),
+    ctx.miniMetric('Average', format(stats.mean)),
+    ctx.miniMetric('Minimum', format(stats.min)),
+    ctx.miniMetric('Maximum', format(stats.max)),
+    ctx.miniMetric('Training days', format(split.training)),
+    ctx.miniMetric('Rest days', format(split.rest)),
+  );
+  return panel(ctx, ctx.panelHeader('Summary', rangeLabel(ctx, current)), row);
+}
+
+function tablePanel(ctx, metric, unit, rows, markers) {
+  const { node, add } = ctx;
+  const { formatDay, MISSING } = ctx.format;
+  const cell = cellFormat(ctx, metric);
+  const table = node('table', 'sets-table');
+  const headRow = node('tr');
+  for (const text of ['Date', columnLabel(metric, unit), '7-day mean', 'Day']) headRow.append(node('th', '', text));
+  const tbody = node('tbody');
+  for (const point of rows) {
+    add(tbody, add(node('tr'),
+      node('td', '', formatDay(point.date, { weekday: 'short', month: 'short', day: 'numeric' })),
+      node('td', '', point.value == null ? MISSING : cell(point.value)),
+      node('td', '', point.mean == null ? MISSING : cell(point.mean)),
+      node('td', '', markers.has(point.date) ? 'Training' : 'Rest'),
+    ));
+  }
+  add(table, add(node('thead'), headRow), tbody);
+  return panel(ctx, ctx.panelHeader('Daily values', 'Last 30 days · newest first'), add(node('div', 'metrics-table'), table));
+}
+
+function trendsBody(ctx, data) {
+  const { state } = ctx;
+  const { plural } = ctx.format;
+  if (noSeriesData(data)) return [panel(ctx, sourceEmptyState(ctx, data))];
+
+  const metric = metricByKey(trendMetric) || METRICS[0];
+  const { current, previous } = windows(ctx, data);
+  const unit = displayUnit(ctx, metric);
+  const format = valueFormat(ctx, metric, unit);
+  const points = fillDays(displaySeries(ctx, metric, data), current.from, current.to);
+  const means = rollingMean(points);
+  const markers = workoutDates(state);
+  const stats = summarize(points, fillDays(displaySeries(ctx, metric, data), previous.from, previous.to));
+  const split = trainingDaySplit(points, markers);
+
+  const scope = metric.category === 'sleep' ? 'per night' : unit;
+  const subtitle = `${rangeLabel(ctx, current)} · ${scope}${stats.count ? ` · ${plural(stats.count, 'day')} with data` : ''}`;
+  const build = metric.chart === 'bar' ? barChart : lineChart;
+  const chart = chartPanel(ctx, metric.label, subtitle, ({ compact }) => build({
+    points,
+    mean: means,
+    unit,
+    label: `${metric.label} by day with 7-day mean`,
+    decimals: metric.decimals,
+    markers,
+    format,
+    axisFormat: axisFormat(ctx, metric, points),
+    height: compact ? 0 : 300,
+    compact,
+  }));
+
+  const recent = points.map((point, index) => ({ ...point, mean: means[index] })).slice(-30).reverse();
+  return [chart, summaryPanel(ctx, stats, split, current, format), tablePanel(ctx, metric, unit, recent, markers)];
+}
+
 export function renderMetricsTrends(ctx) {
-  const { node, add, state } = ctx;
   const fromHash = trendsHashKey();
   if (fromHash) trendMetric = fromHash;
   else if (location.hash.slice(1).split('/')[0] === 'metrics-trends') history.replaceState(null, '', `#metrics-trends/${trendMetric}`);
-  const metric = metricByKey(trendMetric) || METRICS[0];
-  const view = node('section', 'view section-page metrics-view');
-  const body = node('div', 'metrics-body');
   const select = metricSelect(ctx, (key) => { trendMetric = key; location.hash = `#metrics-trends/${key}`; });
-  add(view, viewHeader(ctx, 'Trends', 'Follow one metric over time and compare training days with rest days.', select, periodPicker(ctx, () => rerender(view, renderMetricsTrends(ctx)))), body);
-  const days = periodDays(period);
-  loadInto(ctx, view, body, fetchDays(days), (data) => {
-    body.replaceChildren();
-    if (noSeriesData(data)) { const panel = node('section', 'panel'); panel.append(sourceEmptyState(ctx, data)); body.append(panel); return; }
-    const { current, previous } = windows(data);
-    const unit = displayUnit(ctx, metric);
-    const format = formatterFor(metric, unit);
-    const filled = fillDays(displaySeries(ctx, metric, data), current.from, current.to);
-    const means = rollingMean(filled);
-    const markers = workoutDates(state);
-    const stats = summarize(filled, fillDays(displaySeries(ctx, metric, data), previous.from, previous.to));
-    const split = trainingDaySplit(filled, markers);
-
-    const panel = node('section', 'panel');
-    add(panel, panelHeader(ctx, metric.label, `${labelDate(current.from)} – ${labelDate(current.to)} · ${unit}${stats.count ? ` · ${stats.count} day${stats.count === 1 ? '' : 's'} with data` : ''}`));
-    const options = { points: filled, mean: means, unit, label: `${metric.label} by day with 7-day mean`, decimals: metric.decimals, markers, height: 300, format };
-    panel.append(metric.chart === 'bar' ? barChart(options) : lineChart(options));
-    body.append(panel);
-
-    const row = node('div', 'trend-stats');
-    const mini = (label, value) => add(node('div', 'mini-metric'), node('span', '', label), node('strong', '', value));
-    add(row,
-      mini(stats.latestDate ? `Latest · ${labelDate(stats.latestDate)}` : 'Latest', format(stats.latest)),
-      mini('Average', format(stats.mean)),
-      mini('Minimum', format(stats.min)),
-      mini('Maximum', format(stats.max)),
-      mini('Training / rest days', `${format(split.training)} / ${format(split.rest)}`),
-    );
-    body.append(row);
-
-    const tablePanel = node('section', 'panel');
-    add(tablePanel, panelHeader(ctx, 'Daily values', 'Last 30 days · newest first'));
-    const wrap = node('div', 'metrics-table');
-    const table = node('table', 'sets-table');
-    const head = node('thead'), headRow = node('tr');
-    for (const text of ['Date', metric.label, '7-day mean', 'Day']) headRow.append(node('th', '', text));
-    head.append(headRow);
-    const tbody = node('tbody');
-    const recent = filled.map((point, index) => ({ ...point, mean: means[index] })).slice(-30).reverse();
-    for (const point of recent) {
-      const tr = node('tr');
-      add(tr,
-        node('td', '', labelDate(point.date, { weekday: 'short', month: 'short', day: 'numeric' })),
-        node('td', '', point.value == null ? '—' : format(point.value)),
-        node('td', '', point.mean == null ? '—' : format(point.mean)),
-        node('td', '', markers.has(point.date) ? 'Training' : 'Rest'),
-      );
-      tbody.append(tr);
-    }
-    add(table, head, tbody);
-    wrap.append(table);
-    tablePanel.append(wrap);
-    body.append(tablePanel);
-  });
-  return view;
+  return metricsView(
+    ctx,
+    'Trends',
+    'Follow one metric over time and compare training days with rest days.',
+    trendsBody,
+    [select],
+  );
 }

@@ -115,7 +115,7 @@ Routine counts cover one session of that routine. Program counts cover one pass 
 
 ## Configure Hevy
 
-Create a key in Hevy at <https://hevy.com/settings?developer>. The UI has a local settings form for the key. For command-line use, `HEVY_API_KEY` can be supplied through the process environment. Keep the key out of source control; local settings are intended to be stored with mode `0600`.
+Create a key in Hevy at <https://hevy.com/settings?developer>. Paste it into the **Hevy** card in **Settings** and click **Save key**; **Sync now** on the same card imports your archive, and **Disconnect** forgets the key while keeping every workout already imported to this device. For command-line use, `HEVY_API_KEY` can be supplied through the process environment. Keep the key out of source control; local settings are intended to be stored with mode `0600`.
 
 The first sync imports a complete paginated snapshot of workouts, routines, and exercise templates. Later manual syncs reconcile the snapshot in one SQLite transaction. Records that disappeared from Hevy are removed from the current imported dataset after a successful snapshot; exports are regenerated from that current dataset and do not provide deletion history. A separate synthetic demo dataset is available for screenshots and exploration; it is kept separate from live imported data and can be disabled before a real sync.
 
@@ -129,7 +129,7 @@ Corpus imports daily health data through the Google Health API. Google Fit and t
 4. Create an OAuth client under **Credentials → Create credentials → OAuth client ID** with application type **Desktop app**.
 5. Paste the client ID and client secret into **Settings → Google Health** in Corpus.
 6. Click **Connect**. A Google sign-in tab opens; approve the "unverified app" warning, which is expected for a personal app in Testing, and grant the read-only scopes. Google redirects back to the local server, and Settings shows the connection.
-7. Open **Metrics → Dashboard** and click **Sync Google Health**.
+7. Click **Sync now** on the Google Health card (or **Sync** in the top bar, which syncs every connected source).
 
 Imported metrics: steps, distance, active zone minutes, energy burned, resting heart rate, heart rate variability, blood oxygen, sleep with deep/light/REM/awake stages, weight, body fat, and cardio fitness (VO₂ max). Sleep is dated by the morning you woke up. Weight follows your kg/lb preference.
 

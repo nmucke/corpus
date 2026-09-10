@@ -27,37 +27,39 @@ export function routinePayload(title, notes, exercises, unit, existingRoutine = 
 }
 
 export function openRoutineBuilder(ctx, existingRoutine = null) {
-  const { state, node, add, api, refresh, toast, openDialog, closeDialog } = ctx;
+  const { state, node, add, api, refresh, toast, openDialog, closeDialog, button, field, settingsLink } = ctx;
   const unit = state.settings.unit || 'kg';
   const form = node('form', 'dialog-form routine-builder');
   const requestId = crypto.randomUUID();
   const exercises = [];
   const templates = [...state.exerciseTemplates].sort((a, b) => String(a.title || a.id).localeCompare(String(b.title || b.id)));
+  const missingKey = state.mode === 'live' && !state.settings.hasApiKey;
   const canPublish = state.mode === 'live' && state.settings.hasApiKey && templates.length > 0;
-  const button = (text, action, style = 'button secondary') => {
-    const el = node('button', style, text); el.type = 'button'; el.addEventListener('click', action); return el;
-  };
-  const field = (label, { value = '', type = 'text', required = false, maxLength, tag = 'input' } = {}) => {
-    const wrapper = node('label', 'field'), input = node(tag, 'input');
-    if (tag === 'input') input.type = type;
-    input.value = value; input.required = required;
-    if (maxLength) input.maxLength = maxLength;
-    add(wrapper, node('span', '', label), input); return { wrapper, input };
-  };
-  add(form, node('p', '', existingRoutine ? 'Edit this routine in Hevy. Its folder and other saved targets stay attached while you change the routine.' : 'Build a workout here, then create it in Hevy’s My Routines folder. You can use it in the gym and add it to a Corpus program.'));
+
+  form.append(node('p', 'note', existingRoutine
+    ? 'Edit this routine in Hevy. Its folder and other saved targets stay attached while you change the routine.'
+    : 'Build a workout here, then create it in Hevy’s My Routines folder. You can use it in the gym and add it to a Corpus program.'));
   if (!canPublish) {
-    const info = node('p', 'demo-banner', state.mode === 'demo' ? 'Demo preview only. Switch to live data and sync Hevy to publish a routine using your exercise library.' : 'Add your Hevy key in Settings and sync once to load the exercise library.');
-    form.append(info);
+    const notice = node('div', 'notice notice--info');
+    const body = add(node('div', 'notice-body'), node('p', '', state.mode === 'demo'
+      ? 'Demo preview only. Switch to live data and sync Hevy to publish a routine using your exercise library.'
+      : missingKey
+        ? 'Add your Hevy key in Settings, then sync once to load the exercise library.'
+        : 'Sync Hevy once to load your exercise library, then create a routine.'));
+    add(notice, body, missingKey ? add(node('div', 'notice-action'), settingsLink()) : null);
+    form.append(notice);
   }
+
   const title = field('Routine name', { value: existingRoutine?.title ?? '', required: true, maxLength: 160 });
-  const notes = field('Routine notes', { value: existingRoutine?.notes ?? '', tag: 'textarea', maxLength: 4000 }); notes.input.rows = 2;
-  add(form, title.wrapper, notes.wrapper);
+  const notes = field('Routine notes', { tag: 'textarea', value: existingRoutine?.notes ?? '', maxLength: 4000, rows: 2 });
+  add(form, title, notes);
+
   const picker = node('section', 'routine-picker');
-  const search = field('Find an exercise', { type: 'search' }); search.input.placeholder = 'Search by name or muscle';
-  const selectField = node('label', 'field'), select = node('select', 'select');
-  add(selectField, node('span', '', 'Exercise'), select);
+  const search = field('Find an exercise', { type: 'search', placeholder: 'Search by name or muscle' });
+  const exercise = field('Exercise', { options: [] });
+  const select = exercise.control;
   function filterTemplates() {
-    const previous = select.value, query = search.input.value.toLowerCase();
+    const previous = select.value, query = search.control.value.toLowerCase();
     select.replaceChildren();
     for (const template of templates.filter(t => `${t.title} ${t.primary_muscle_group || ''}`.toLowerCase().includes(query))) {
       const option = node('option', '', template.title); option.value = template.id; select.append(option);
@@ -66,16 +68,21 @@ export function openRoutineBuilder(ctx, existingRoutine = null) {
     addExercise.disabled = !select.options.length || exercises.length >= 50;
   }
   const exerciseList = node('div', 'routine-exercise-list');
-  const addExercise = button('+ Add exercise', () => {
+  const addExercise = button('Add exercise', { icon: '+', onClick: () => {
     const template = templates.find(t => t.id === select.value);
     if (template && exercises.length < 50) { makeExercise(template); filterTemplates(); }
-  });
-  search.input.addEventListener('input', filterTemplates); filterTemplates();
-  add(picker, search.wrapper, selectField, addExercise);
-  add(form, picker, exerciseList, node('p', 'field-hint', 'Set targets are optional. Use “Reps” alone for a fixed count, or add “To” for a rep range. Loads use your display unit; time is seconds and distance is meters.'));
+  } });
+  search.control.addEventListener('input', filterTemplates); filterTemplates();
+  add(picker, search, exercise, addExercise);
+  add(form, picker, exerciseList,
+    node('p', 'note', 'Set targets are optional. Use Reps alone for a fixed count, or add Reps (to) for a range.'));
+
   const error = node('p', 'form-error'); error.setAttribute('role', 'alert'); form.append(error);
-  const publish = node('button', 'button primary', existingRoutine ? 'Save changes to Hevy' : 'Create in Hevy'); publish.type = 'submit'; publish.disabled = !canPublish;
-  const actions = node('div', 'dialog-actions'); add(actions, button('Cancel', closeDialog), publish); form.append(actions);
+  const publish = button(existingRoutine ? 'Save changes to Hevy' : 'Create in Hevy', { variant: 'primary', type: 'submit' });
+  const publishLabel = publish.querySelector('span');
+  publish.disabled = !canPublish;
+  form.append(add(node('div', 'dialog-actions'), button('Cancel', { onClick: closeDialog }), publish));
+
   if (existingRoutine) {
     for (const savedExercise of existingRoutine.exercises || []) {
       const template = templates.find(item => item.id === savedExercise.exercise_template_id)
@@ -83,6 +90,7 @@ export function openRoutineBuilder(ctx, existingRoutine = null) {
       makeExercise(template, savedExercise);
     }
   }
+
   form.addEventListener('submit', async event => {
     event.preventDefault(); error.textContent = '';
     if (!canPublish) return;
@@ -90,31 +98,31 @@ export function openRoutineBuilder(ctx, existingRoutine = null) {
     if (exercises.some(ex => ex.oversized)) { error.textContent = 'This saved routine has more than 50 sets in one exercise. Remove sets before saving changes.'; return; }
     const values = exercises.map(ex => ({ id: ex.id, rest: ex.rest.value, notes: ex.savedNotes === null && ex.notes.value === '' ? null : ex.notes.value, superset_id: ex.superset_id,
       sets: ex.sets.map(set => ({ ...Object.fromEntries(Object.entries(set.fields).map(([key, input]) => [key, input.value])), customMetric: set.customMetric })) }));
-    const payload = routinePayload(title.input.value, existingRoutine?.notes === null && notes.input.value === '' ? null : notes.input.value, values, unit, existingRoutine);
+    const payload = routinePayload(title.control.value, existingRoutine?.notes === null && notes.control.value === '' ? null : notes.control.value, values, unit, existingRoutine);
     for (const exercise of payload.exercises) {
       if (!exercise.sets.length) { error.textContent = 'Each exercise needs at least one set.'; return; }
       if (exercise.sets.some(s => s.rep_range && (s.rep_range.start == null || s.rep_range.start < 1 || s.rep_range.end < s.rep_range.start))) {
         error.textContent = 'Rep ranges need a starting count and an ending count at least as large.'; return;
       }
     }
-    publish.disabled = true; publish.textContent = existingRoutine ? 'Saving changes in Hevy…' : 'Creating in Hevy…';
+    publish.disabled = true; publishLabel.textContent = existingRoutine ? 'Saving changes in Hevy…' : 'Creating in Hevy…';
     let completed = false;
     try {
       const endpoint = existingRoutine ? `/api/routines/${encodeURIComponent(existingRoutine.id)}` : '/api/routines';
       const result = await api(endpoint, { method: existingRoutine ? 'PUT' : 'POST', body: JSON.stringify({ requestId, ...payload }) });
       completed = true; closeDialog();
-      toast(existingRoutine ? 'Routine updated in Hevy' : 'Routine created in Hevy', result.warning || (existingRoutine ? 'Your saved routine has been updated.' : 'It is ready in My Routines.'));
-      try { await refresh(); } catch { toast(existingRoutine ? 'Routine updated' : 'Routine created', 'Refresh Corpus to see the new routine.', 'error'); }
+      toast(existingRoutine ? 'Routine updated' : 'Routine created', result.warning || (existingRoutine ? 'Your saved routine has been updated in Hevy.' : 'It is ready in My Routines.'));
+      try { await refresh(); } catch { toast('Couldn’t refresh Corpus', 'The routine was saved in Hevy. Reload to see it.', 'error'); }
     } catch (err) {
       error.textContent = err.message;
       if (['publication_uncertain', 'publication_pending', 'publish_uncertain'].includes(err.code)) {
-        completed = true; publish.textContent = existingRoutine ? 'Check Hevy before saving again' : 'Check Hevy before creating again';
+        completed = true; publishLabel.textContent = existingRoutine ? 'Check Hevy before saving again' : 'Check Hevy before creating again';
       }
     } finally {
-      if (!completed) { publish.disabled = false; publish.textContent = existingRoutine ? 'Save changes to Hevy' : 'Create in Hevy'; }
+      if (!completed) { publish.disabled = false; publishLabel.textContent = existingRoutine ? 'Save changes to Hevy' : 'Create in Hevy'; }
     }
   });
-  openDialog(existingRoutine ? 'Edit Hevy routine' : 'Publish a new workout', existingRoutine ? 'Edit routine' : 'Create a Hevy routine', form);
+  openDialog('Hevy routine', existingRoutine ? 'Edit routine' : 'Create routine', form);
 
   function makeExercise(template, savedExercise = null) {
     const block = node('section', 'routine-draft-exercise'), top = node('div', 'routine-draft-heading');
@@ -126,18 +134,25 @@ export function openRoutineBuilder(ctx, existingRoutine = null) {
       exerciseList.replaceChildren(...exercises.map(e => e.block));
     };
     const controls = node('div', 'routine-order-controls');
-    const up = button('↑', () => move(-1)), down = button('↓', () => move(1));
+    const up = button('', { size: 'sm', icon: '↑', title: 'Move up', onClick: () => move(-1) });
+    const down = button('', { size: 'sm', icon: '↓', title: 'Move down', onClick: () => move(1) });
     up.setAttribute('aria-label', `Move ${template.title} up`); down.setAttribute('aria-label', `Move ${template.title} down`);
-    add(controls, up, down, button('Remove', () => { exercises.splice(exercises.indexOf(record), 1); block.remove(); filterTemplates(); }));
+    add(controls, up, down, button('Remove', { variant: 'danger', size: 'sm', title: `Remove ${template.title}`, onClick: () => {
+      exercises.splice(exercises.indexOf(record), 1); block.remove(); filterTemplates();
+    } }));
     add(top, node('h3', '', template.title), controls); block.append(top);
-    const rest = field('Rest between sets (seconds)', { type: 'number', value: savedExercise ? savedExercise.rest_seconds ?? '' : '90' }); rest.input.min = '0'; rest.input.step = '1';
-    const note = field('Exercise notes', { value: savedExercise?.notes ?? '', maxLength: 4000 }); record.rest = rest.input; record.notes = note.input;
-    add(block, add(node('div', 'routine-exercise-options'), rest.wrapper, note.wrapper));
+    const rest = field('Rest (s)', { type: 'number', value: savedExercise ? savedExercise.rest_seconds ?? '' : '90' });
+    rest.control.min = '0'; rest.control.step = '1';
+    const note = field('Exercise notes', { tag: 'textarea', value: savedExercise?.notes ?? '', maxLength: 4000, rows: 2 });
+    record.rest = rest.control; record.notes = note.control;
+    add(block, add(node('div', 'routine-exercise-options'), rest, note));
     const tableWrap = node('div', 'routine-set-scroll'), table = node('table', 'sets-table');
     const headings = node('tr');
-    for (const label of ['Type', `Load (${unit})`, 'Reps', 'To', 'Time (s)', 'Distance (m)', '']) { const th = node('th', '', label); th.scope = 'col'; headings.append(th); }
+    for (const label of ['Type', `Load (${unit})`, 'Reps', 'Reps (to)', 'Time (s)', 'Distance (m)', '']) { const th = node('th', '', label); th.scope = 'col'; headings.append(th); }
     add(table, add(node('thead'), headings)); const tbody = node('tbody'); table.append(tbody); tableWrap.append(table); block.append(tableWrap);
-    const addSet = button('+ Add set', () => makeSet()); block.append(addSet);
+    const warning = node('p', 'form-warning');
+    block.append(add(node('div', 'form-row'), button('Add set', { size: 'sm', icon: '+', onClick: () => makeSet() })));
+    block.append(warning);
     function makeSet(savedSet = null) {
       if (record.sets.length >= 50 && !savedSet) return;
       const row = node('tr'), set = { fields: {} };
@@ -145,7 +160,7 @@ export function openRoutineBuilder(ctx, existingRoutine = null) {
       for (const value of ['normal', 'warmup', 'failure', 'dropset']) { const option = node('option', '', value); option.value = value; type.append(option); }
       if (savedSet?.type) type.value = savedSet.type;
       set.fields.type = type; row.append(add(node('td'), type));
-      for (const [key, label] of [['weight', `Load in ${unit}`], ['reps', 'Repetitions'], ['repEnd', 'Rep range end'], ['duration', 'Duration in seconds'], ['distance', 'Distance in meters']]) {
+      for (const [key, label] of [['weight', `Load (${unit})`], ['reps', 'Reps'], ['repEnd', 'Reps (to)'], ['duration', 'Time (s)'], ['distance', 'Distance (m)']]) {
         const input = node('input', 'input'); input.type = 'number'; input.min = key === 'repEnd' ? '1' : '0'; input.step = key === 'weight' ? 'any' : '1'; input.placeholder = '—'; input.setAttribute('aria-label', label);
         if (key === 'reps' && /reps/.test(template.type || '')) input.value = '8';
         if (savedSet) {
@@ -161,20 +176,17 @@ export function openRoutineBuilder(ctx, existingRoutine = null) {
         set.fields[key] = input; row.append(add(node('td'), input));
       }
       set.customMetric = savedSet?.custom_metric;
-      const remove = button('×', () => {
+      const remove = button('', { size: 'sm', icon: '×', title: 'Remove set', onClick: () => {
         record.sets.splice(record.sets.indexOf(set), 1); row.remove();
-        if (record.oversized && record.sets.length <= 50) {
-          record.oversized = false;
-          block.querySelector('.form-error')?.remove();
-        }
-      }); remove.setAttribute('aria-label', 'Remove set');
+        if (record.oversized && record.sets.length <= 50) { record.oversized = false; warning.textContent = ''; }
+      } });
       row.append(add(node('td'), remove)); record.sets.push(set); tbody.append(row);
     }
     exercises.push(record); exerciseList.append(block);
     if (savedExercise?.sets?.length) {
       record.oversized = savedExercise.sets.length > 50;
       savedExercise.sets.forEach(makeSet);
-      if (record.oversized) block.append(node('p', 'form-error', 'This exercise has more than 50 saved sets. Remove sets before saving changes.'));
+      if (record.oversized) warning.textContent = 'This exercise has more than 50 saved sets. Remove sets before saving changes.';
     } else makeSet();
   }
 }

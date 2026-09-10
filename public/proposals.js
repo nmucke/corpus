@@ -1,51 +1,36 @@
 import { openMuscleCoverage } from './muscle-map.js';
 import { markdownBlock, markdownPreview } from './markdown.js';
 
+// "Draft" is the user-facing noun (D23); `proposal` stays the API/code term.
 const PENDING_STATUSES = new Set(['draft', 'revision_requested']);
+
+const PROFILE_FIELDS = [
+  ['goals', 'Goals', 'What are you training toward?'],
+  ['equipment', 'Equipment', 'What equipment is available?'],
+  ['constraints', 'Constraints', 'Injuries, limits, preferences, or exclusions.'],
+  ['schedule', 'Schedule', 'Days, session length, or timing preferences.'],
+];
+
+const REVIEW_TOASTS = {
+  accept: ['Draft accepted', 'Its routines and programs are now in your local training archive.'],
+  decline: ['Draft declined', 'Nothing was added to your local training archive.'],
+  request_revision: ['Revision requested', 'Your feedback is saved for the assistant’s next revision.'],
+};
 
 function statusLabel(status) {
   return String(status || 'draft').replaceAll('_', ' ').replace(/\b\w/g, letter => letter.toUpperCase());
-}
-
-function dateLabel(value) {
-  if (!value) return 'Unknown date';
-  const date = new Date(value);
-  return Number.isNaN(date.getTime()) ? String(value) : new Intl.DateTimeFormat(undefined, { dateStyle: 'medium' }).format(date);
-}
-
-function formatDateOnly(value) {
-  if (!value) return 'No start date';
-  const date = new Date(`${value}T00:00:00`);
-  return Number.isNaN(date.getTime()) ? String(value) : new Intl.DateTimeFormat(undefined, { dateStyle: 'medium' }).format(date);
 }
 
 function pendingCount(proposals = []) {
   return proposals.filter(proposal => PENDING_STATUSES.has(proposal?.status)).length;
 }
 
-function countSummary(proposal) {
+function countSummary(proposal, format) {
   const routines = Array.isArray(proposal?.routines) ? proposal.routines.length : 0;
   const programs = Array.isArray(proposal?.programs) ? proposal.programs.length : 0;
-  const parts = [`${routines} ${routines === 1 ? 'routine' : 'routines'}`];
-  if (programs) parts.push(`${programs} ${programs === 1 ? 'program' : 'programs'}`);
+  const parts = [format.plural(routines, 'routine')];
+  if (programs) parts.push(format.plural(programs, 'program'));
   return parts.join(' · ');
-}
-
-function text(node, value) {
-  node.textContent = value == null ? '' : String(value);
-  return node;
-}
-
-function add(parent, ...children) {
-  for (const child of children.flat()) if (child) parent.append(child);
-  return parent;
-}
-
-function button(node, label, handler, className = 'button secondary') {
-  const element = node('button', className, label);
-  element.type = 'button';
-  element.addEventListener('click', handler);
-  return element;
 }
 
 function copyObject(value) {
@@ -99,271 +84,286 @@ export function openDraftCoverage(ctx, proposal, { routineKey, programKey } = {}
   }
 }
 
-function statusBadge(node, proposal) {
-  const badge = node('span', `program-badge status-${proposal.status || 'draft'}`, statusLabel(proposal.status));
-  badge.setAttribute('role', 'status');
-  return badge;
+/* --------------------------------------------------------------- draft list */
+
+function statusPill(ctx, proposal) {
+  return ctx.node('span', `pill status-${proposal.status || 'draft'}`, statusLabel(proposal.status));
 }
 
 function renderProposalCard(ctx, proposal, openDetail) {
-  const { node } = ctx;
-  const card = node('article', 'proposal-card');
-  const top = node('div', 'proposal-card-top');
-  add(top, node('p', 'card-kicker', proposal.mode === 'revision' ? 'Revision' : 'AI draft'), statusBadge(node, proposal));
-  const title = node('h2', '', proposal.title || 'Untitled AI draft');
-  const meta = node('p', 'proposal-meta', `Revision ${proposal.revision ?? 1} · Updated ${dateLabel(proposal.updated_at || proposal.created_at)}`);
-  const summary = node('p', 'proposal-summary', countSummary(proposal));
-  const rationale = node('p', 'proposal-rationale', markdownPreview(proposal.rationale) || 'No rationale was provided.');
+  const { node, add, button, format, setBusy } = ctx;
+  const card = node('article', 'card proposal-card');
+  const top = add(node('div', 'proposal-card-top'),
+    node('p', 'label-caps', (proposal.revision ?? 1) > 1 ? 'Revision' : 'AI draft'),
+    statusPill(ctx, proposal));
+  const updated = format.dateLabel(proposal.updated_at || proposal.created_at, { dateStyle: 'medium' });
+  const meta = node('p', 'card-meta', `Revision ${proposal.revision ?? 1} · Updated ${updated} · ${countSummary(proposal, format)}`);
+  const rationale = node('p', 'note proposal-rationale', markdownPreview(proposal.rationale) || 'No rationale was provided.');
   rationale.title = rationale.textContent;
-  const actions = node('div', 'card-actions');
-  let opening = false;
-  const reviewButton = button(node, proposal.status === 'draft' ? 'Review draft' : 'View status', async () => {
-    if (opening) return;
-    opening = true; reviewButton.disabled = true;
-    try { await openDetail(proposal); } finally { opening = false; reviewButton.disabled = false; }
-  }, 'button primary');
-  actions.append(reviewButton);
-  add(card, top, title, meta, summary, rationale, actions);
-  return card;
+  const review = button(proposal.status === 'draft' ? 'Review draft' : 'View status', {
+    variant: 'primary',
+    size: 'sm',
+    onClick: async () => {
+      if (review.disabled) return;
+      setBusy(review, true);
+      try { await openDetail(proposal); } finally { setBusy(review, false); }
+    },
+  });
+  return add(card, top, node('h3', 'card-title', proposal.title || 'Untitled AI draft'), meta, rationale, add(node('div', 'card-actions'), review));
 }
 
-function valueLabel(node, label, value) {
-  const block = node('div', 'proposal-value');
-  add(block, node('span', '', label), node('strong', '', value == null || value === '' ? '—' : value));
-  return block;
+/* ------------------------------------------------------------ review dialog */
+
+function valueLabel(ctx, label, value) {
+  const { node, add, format } = ctx;
+  return add(node('div', 'proposal-value'), node('span', '', label), node('strong', '', value == null || value === '' ? format.MISSING : value));
 }
 
-function setText(set, unit = 'kg') {
-  const range = set?.rep_range;
-  const parts = [];
-  if (range && typeof range === 'object') parts.push(`${range.start ?? '—'}–${range.end ?? '—'} reps`);
-  else if (set?.reps != null) parts.push(`${set.reps} reps`);
-  if (set?.weight_kg != null) {
-    const weight = Number(set.weight_kg);
-    const display = unit === 'lb' && Number.isFinite(weight) ? weight * 2.2046226218 : weight;
-    parts.push(`${Number.isFinite(display) ? new Intl.NumberFormat(undefined, { maximumFractionDigits: 1 }).format(display) : set.weight_kg} ${unit}`);
-  }
-  if (set?.duration_seconds != null) parts.push(`${set.duration_seconds} sec`);
-  if (set?.distance_meters != null) parts.push(`${set.distance_meters} m`);
-  if (set?.type && set.type !== 'normal') parts.push(set.type);
-  return parts.join(' · ') || 'Target not specified';
-}
-
-function renderRoutine(node, routine, title = 'Proposed routine', showCoverage = null, unit = 'kg') {
+function renderRoutine(ctx, routine, title, coverageButton = null) {
+  const { node, add, state, format } = ctx;
+  const unit = state.settings?.unit || 'kg';
   const section = node('section', 'proposal-routine');
-  const heading = node('div', 'proposal-section-heading');
-  add(heading, node('h3', '', routine?.title || title));
-  if (showCoverage) heading.append(showCoverage);
+  const heading = add(node('div', 'proposal-section-heading'), node('h3', '', routine?.title || title), coverageButton);
   section.append(heading);
   if (routine?.notes) section.append(markdownBlock(routine.notes, 'exercise-note'));
   for (const exercise of routine?.exercises || []) {
-    const exerciseBlock = node('div', 'proposal-exercise');
-    add(exerciseBlock, node('strong', '', exercise.title || exercise.exercise_template_id || 'Untitled exercise'));
-    if (exercise.notes) exerciseBlock.append(markdownBlock(exercise.notes, 'exercise-note'));
-    if (exercise.rest_seconds != null) exerciseBlock.append(node('p', 'field-hint', `Rest: ${exercise.rest_seconds} seconds`));
+    const block = node('div', 'proposal-exercise');
+    add(block, node('strong', '', exercise.title || exercise.exercise_template_id || 'Untitled exercise'));
+    if (exercise.notes) block.append(markdownBlock(exercise.notes, 'exercise-note'));
+    if (exercise.rest_seconds != null) block.append(node('p', 'note', `Rest · ${format.formatSeconds(exercise.rest_seconds)}`));
     const list = node('ol');
-    for (const set of exercise.sets || []) list.append(node('li', '', setText(set, unit)));
-    if (list.children.length) exerciseBlock.append(list);
-    section.append(exerciseBlock);
+    for (const set of exercise.sets || []) list.append(node('li', '', format.formatSet(set, unit)));
+    if (list.children.length) block.append(list);
+    section.append(block);
   }
-  if (!(routine?.exercises || []).length) section.append(node('p', 'field-hint', 'No exercises in this routine.'));
+  if (!(routine?.exercises || []).length) section.append(node('p', 'note', 'No exercises in this routine.'));
   return section;
 }
 
 function renderRoutineChange(ctx, proposal, item, index) {
-  const { state, node, add } = ctx;
+  const { node, add, button } = ctx;
   const wrap = node('section', 'proposal-change');
   const after = item?.after || {};
   const before = item?.before;
   const routineKey = item?.key || String(index);
-  const coverage = button(node, 'Muscle coverage', () => openDraftCoverage(ctx, proposal, { routineKey }), 'button ghost');
+  const coverage = button('Muscle coverage', { size: 'sm', onClick: () => openDraftCoverage(ctx, proposal, { routineKey }) });
   if (before) {
-    const comparison = node('div', 'proposal-comparison');
-    const beforeCol = node('div', 'proposal-comparison-column');
-    const afterCol = node('div', 'proposal-comparison-column');
-    add(beforeCol, node('p', 'card-kicker', 'Before'), renderRoutine(node, before, 'Previous routine', null, state.settings?.unit || 'kg'));
-    add(afterCol, node('p', 'card-kicker', 'Proposed'), renderRoutine(node, after, 'Proposed routine', coverage, state.settings?.unit || 'kg'));
-    add(comparison, beforeCol, afterCol); wrap.append(comparison);
-  } else wrap.append(renderRoutine(node, after, 'Proposed routine', coverage, state.settings?.unit || 'kg'));
+    const beforeCol = add(node('div', 'proposal-comparison-column'), node('p', 'label-caps', 'Before'), renderRoutine(ctx, before, 'Previous routine'));
+    const afterCol = add(node('div', 'proposal-comparison-column'), node('p', 'label-caps', 'Proposed'), renderRoutine(ctx, after, 'Proposed routine', coverage));
+    wrap.append(add(node('div', 'proposal-comparison'), beforeCol, afterCol));
+  } else wrap.append(renderRoutine(ctx, after, 'Proposed routine', coverage));
   return wrap;
 }
 
-function renderProgram(node, program, title = 'Proposed program', coverageButton = null, routineTitles = new Map()) {
+function renderProgram(ctx, program, title, coverageButton = null, routineTitles = new Map()) {
+  const { node, add, format } = ctx;
   const section = node('section', 'proposal-program');
-  const heading = node('div', 'proposal-section-heading');
-  add(heading, node('h3', '', program?.title || title), coverageButton);
-  const schedule = node('div', 'proposal-meta-grid');
-  add(schedule, valueLabel(node, 'Starts', formatDateOnly(program?.start_date)), valueLabel(node, 'Duration', program?.duration_weeks ? `${program.duration_weeks} weeks` : 'Unscheduled'));
+  const heading = add(node('div', 'proposal-section-heading'), node('h3', '', program?.title || title), coverageButton);
+  const starts = program?.start_date ? format.formatDay(program.start_date, { dateStyle: 'medium' }) : format.NOT_SET;
+  const duration = program?.duration_weeks ? format.plural(program.duration_weeks, 'week') : format.NOT_SET;
+  const schedule = add(node('div', 'proposal-meta-grid'), valueLabel(ctx, 'Starts', starts), valueLabel(ctx, 'Duration', duration));
   section.append(heading);
   if (program?.description) section.append(markdownBlock(program.description, 'exercise-note'));
   section.append(schedule);
   const days = node('ol', 'proposal-days');
   for (const day of program?.days || []) {
-    const routineTitle = day.routineTitle || routineTitles.get(day.routineKey) || routineTitles.get(day.routineId) || day.routineKey || day.routineId || 'Routine not specified';
+    const routineTitle = day.routineTitle || routineTitles.get(day.routineKey) || routineTitles.get(day.routineId) || format.MISSING_ROUTINE;
     days.append(node('li', '', `${day.label || 'Training day'} · ${routineTitle}`));
   }
-  if (days.children.length) section.append(days); else section.append(node('p', 'field-hint', 'No training days in this program.'));
+  section.append(days.children.length ? days : node('p', 'note', 'No training days in this program.'));
   return section;
 }
 
 function renderProgramChange(ctx, proposal, item, index) {
-  const { node, add } = ctx;
+  const { node, add, button } = ctx;
   const before = item?.before;
   const after = item?.after || {};
   const programKey = item?.key || String(index);
   const routineTitles = new Map((proposal.routines || []).map((routine, routineIndex) => [routine.key || String(routineIndex), routine.after?.title || routine.key || 'Untitled routine']));
-  const coverage = button(node, 'Muscle coverage', () => openDraftCoverage(ctx, proposal, { programKey }), 'button ghost');
+  const coverage = button('Muscle coverage', { size: 'sm', onClick: () => openDraftCoverage(ctx, proposal, { programKey }) });
   const wrap = node('section', 'proposal-change');
   if (before) {
-    const comparison = node('div', 'proposal-comparison');
-    add(comparison,
-      add(node('div', 'proposal-comparison-column'), node('p', 'card-kicker', 'Before'), renderProgram(node, before, 'Previous program', null, routineTitles)),
-      add(node('div', 'proposal-comparison-column'), node('p', 'card-kicker', 'Proposed'), renderProgram(node, after, 'Proposed program', coverage, routineTitles)),
-    );
-    wrap.append(comparison);
-  } else wrap.append(renderProgram(node, after, 'Proposed program', coverage, routineTitles));
+    wrap.append(add(node('div', 'proposal-comparison'),
+      add(node('div', 'proposal-comparison-column'), node('p', 'label-caps', 'Before'), renderProgram(ctx, before, 'Previous program', null, routineTitles)),
+      add(node('div', 'proposal-comparison-column'), node('p', 'label-caps', 'Proposed'), renderProgram(ctx, after, 'Proposed program', coverage, routineTitles)),
+    ));
+  } else wrap.append(renderProgram(ctx, after, 'Proposed program', coverage, routineTitles));
   return wrap;
 }
 
 function renderHistory(ctx, history = []) {
-  const { node, add } = ctx;
+  const { node, add, format } = ctx;
   if (!Array.isArray(history) || !history.length) return null;
-  const section = node('section', 'proposal-history');
-  add(section, node('h3', '', 'Review history'));
+  const section = add(node('section', 'proposal-history'), node('h3', '', 'Review history'));
   const list = node('ol');
   for (const item of history) {
     const row = node('li');
-    add(row, node('strong', '', `${statusLabel(item.action || item.status)} · revision ${item.revision ?? '—'}`), node('span', '', dateLabel(item.created_at || item.updated_at)));
+    add(row,
+      node('strong', '', `${statusLabel(item.action || item.status)} · revision ${item.revision ?? format.MISSING}`),
+      node('span', '', format.dateLabel(item.created_at || item.updated_at, { dateStyle: 'medium' })));
     if (item.feedback) row.append(markdownBlock(item.feedback));
     list.append(row);
   }
-  section.append(list); return section;
+  return add(section, list);
 }
 
 function detailContent(ctx, proposal, history, onRefresh) {
-  const { node, add, api, toast, closeDialog } = ctx;
-  const form = node('div', 'proposal-detail');
-  const meta = node('div', 'detail-meta');
-  add(meta, valueLabel(node, 'Status', statusLabel(proposal.status)), valueLabel(node, 'Revision', proposal.revision ?? 1), valueLabel(node, 'Updated', dateLabel(proposal.updated_at || proposal.created_at)));
-  form.append(meta);
+  const { node, add, api, toast, closeDialog, button, field, format, setBusy } = ctx;
+  const content = node('div', 'dialog-stack');
+  const meta = add(node('div', 'detail-meta'),
+    valueLabel(ctx, 'Status', statusLabel(proposal.status)),
+    valueLabel(ctx, 'Revision', proposal.revision ?? 1),
+    valueLabel(ctx, 'Updated', format.dateLabel(proposal.updated_at || proposal.created_at, { dateStyle: 'medium' })));
+  content.append(meta);
   if (proposal.rationale) {
-    const rationale = node('section', 'proposal-rationale-block');
-    add(rationale, node('h3', '', 'Why this draft'), markdownBlock(proposal.rationale));
-    form.append(rationale);
+    content.append(add(node('section', 'proposal-rationale-block'), node('h3', '', 'Why this draft'), markdownBlock(proposal.rationale)));
   }
-  for (const [index, item] of (proposal.routines || []).entries()) form.append(renderRoutineChange(ctx, proposal, item, index));
-  for (const [index, item] of (proposal.programs || []).entries()) form.append(renderProgramChange(ctx, proposal, item, index));
+  for (const [index, item] of (proposal.routines || []).entries()) content.append(renderRoutineChange(ctx, proposal, item, index));
+  for (const [index, item] of (proposal.programs || []).entries()) content.append(renderProgramChange(ctx, proposal, item, index));
   if (proposal.feedback) {
-    const feedback = node('section', 'proposal-feedback');
-    add(feedback, node('h3', '', 'Latest feedback'), markdownBlock(proposal.feedback));
-    form.append(feedback);
+    content.append(add(node('section', 'proposal-feedback'), node('h3', '', 'Latest feedback'), markdownBlock(proposal.feedback)));
   }
   const historySection = renderHistory(ctx, history);
-  if (historySection) form.append(historySection);
+  if (historySection) content.append(historySection);
 
-  const actions = node('div', 'dialog-actions proposal-review-actions');
-  if (proposal.status === 'draft') {
-    const feedbackField = node('label', 'field proposal-feedback-field');
-    const feedback = node('textarea', 'textarea');
-    feedback.rows = 3; feedback.maxLength = 2000; feedback.placeholder = 'Tell the assistant what to change…'; feedback.id = 'proposal-feedback';
-    add(feedbackField, node('span', '', 'Feedback for a revision (required for Request changes)'), feedback);
-    const feedbackError = node('p', 'form-error'); feedbackError.setAttribute('role', 'alert');
-    const request = button(node, 'Request changes', async () => review('request_revision', request), 'button secondary');
-    const accept = button(node, 'Accept draft', async () => review('accept', accept), 'button primary');
-    const decline = button(node, 'Decline', async () => review('decline', decline), 'button danger');
-    form.append(feedbackField, feedbackError, actions);
-    add(actions, decline, request, accept);
-    async function review(action, sourceButton) {
-      if (sourceButton.disabled) return;
-      if (action === 'request_revision' && !feedback.value.trim()) { feedbackError.textContent = 'Add feedback before requesting changes.'; feedback.focus(); return; }
-      feedbackError.textContent = '';
-      [accept, request, decline].forEach(item => { item.disabled = true; });
-      try {
-        await api(`/api/proposals/${encodeURIComponent(proposal.id)}/review`, { method: 'POST', body: JSON.stringify({ action, expectedRevision: proposal.revision, ...(feedback.value.trim() ? { feedback: feedback.value.trim() } : {}) }) });
-        closeDialog();
-        await onRefresh();
-        toast(action === 'accept' ? 'AI draft accepted' : action === 'decline' ? 'AI draft declined' : 'Revision request saved', action === 'request_revision' ? 'The feedback is saved. Ask the training assistant to prepare the next revision.' : 'The local proposal state is up to date.');
-      } catch (error) {
-        feedbackError.textContent = error.code === 'stale_revision' || error.code === 'revision_conflict' ? 'This draft changed elsewhere. Refresh and review the latest revision.' : error.message;
-        [accept, request, decline].forEach(item => { item.disabled = false; });
-      }
-    }
-  } else {
+  const close = button('Close', { onClick: () => closeDialog() });
+  if (proposal.status !== 'draft') {
     const note = proposal.status === 'revision_requested'
       ? 'Feedback is saved and this draft is waiting for the training assistant to prepare a new revision.'
-      : `This proposal is ${statusLabel(proposal.status).toLowerCase()} and is read-only.`;
-    form.append(actions, node('p', 'field-hint', note));
+      : `This draft is ${statusLabel(proposal.status).toLowerCase()} and is read-only.`;
+    return add(content, node('p', 'note', note), add(node('div', 'dialog-actions'), close));
   }
-  return form;
+
+  const feedbackField = field('Feedback for a revision', { tag: 'textarea', rows: 3, maxLength: 2000, placeholder: 'Tell the assistant what to change…', hint: 'Required for Request changes.' });
+  const feedback = feedbackField.control;
+  const error = node('p', 'form-error');
+  error.setAttribute('role', 'alert');
+  const decline = button('Decline', { onClick: () => review('decline', decline) });
+  const request = button('Request changes', { onClick: () => review('request_revision', request) });
+  const accept = button('Accept draft', { variant: 'primary', onClick: () => review('accept', accept) });
+
+  async function review(action, source) {
+    if (source.disabled) return;
+    if (action === 'request_revision' && !feedback.value.trim()) {
+      error.textContent = 'Add feedback before requesting changes.';
+      feedback.focus();
+      return;
+    }
+    error.textContent = '';
+    [accept, request, decline].forEach(item => { item.disabled = true; });
+    setBusy(source, true);
+    try {
+      await api(`/api/proposals/${encodeURIComponent(proposal.id)}/review`, {
+        method: 'POST',
+        body: JSON.stringify({ action, expectedRevision: proposal.revision, ...(feedback.value.trim() ? { feedback: feedback.value.trim() } : {}) }),
+      });
+      closeDialog();
+      await onRefresh();
+      toast(...REVIEW_TOASTS[action]);
+    } catch (err) {
+      error.textContent = err.code === 'stale_revision' || err.code === 'revision_conflict'
+        ? 'This draft changed elsewhere. Refresh and review the latest revision.'
+        : err.message;
+      setBusy(source, false);
+      [accept, request, decline].forEach(item => { item.disabled = false; });
+    }
+  }
+
+  return add(content, feedbackField, error, add(node('div', 'dialog-actions'), close, decline, request, accept));
 }
 
 async function openProposalDetail(ctx, proposal) {
-  const { api, openDialog } = ctx;
+  const { api, openDialog, toast } = ctx;
   let record = proposal;
   try {
     const result = await api(`/api/proposals/${encodeURIComponent(proposal.id)}`);
     record = result.proposal || result.record || result;
   } catch (error) {
-    ctx.toast('Could not load draft detail', error.message, 'error');
+    toast('Couldn’t review draft', error.message, 'error');
     return;
   }
-  const history = record.history || [];
-  openDialog('AI draft review', record.title || 'Untitled AI draft', detailContent(ctx, record, history, async () => { await ctx.refresh(); }));
+  openDialog('AI draft', record.title || 'Untitled AI draft', detailContent(ctx, record, record.history || [], async () => { await ctx.refresh(); }));
 }
 
-function profileForm(ctx) {
-  const { state, node, add, api, refresh, toast } = ctx;
+/* ---------------------------------------------------------- training profile */
+
+function profilePanel(ctx) {
+  const { state, node, add, api, refresh, toast, field, button, panelHeader, setBusy } = ctx;
   const profile = state.trainingProfile || {};
-  const form = node('form', 'panel profile-form');
+  const form = node('form', 'profile-form');
+  // The poller in app.js skips a re-render while this form has unsaved edits.
   form.dataset.dirty = 'false';
-  const fields = {};
-  for (const [key, label, hint] of [
-    ['goals', 'Goals', 'What are you training toward?'],
-    ['equipment', 'Equipment', 'What equipment is available?'],
-    ['constraints', 'Constraints', 'Injuries, limits, preferences, or exclusions.'],
-    ['schedule', 'Schedule', 'Days, session length, or timing preferences.'],
-  ]) {
-    const field = node('label', 'field'); const input = node('textarea', 'textarea'); input.rows = 2; input.maxLength = 2000; input.value = profile[key] || ''; input.placeholder = hint; input.id = `training-profile-${key}`;
-    input.addEventListener('input', () => { form.dataset.dirty = 'true'; });
-    add(field, node('span', '', label), input); add(form, field); fields[key] = input;
+  const controls = {};
+  for (const [key, label, placeholder] of PROFILE_FIELDS) {
+    const wrapper = field(label, { tag: 'textarea', placeholder, maxLength: 2000, rows: 2, value: profile[key] || '' });
+    wrapper.control.addEventListener('input', () => { form.dataset.dirty = 'true'; });
+    controls[key] = wrapper.control;
+    form.append(wrapper);
   }
-  const status = node('p', 'form-error'); status.setAttribute('role', 'alert');
-  const save = node('button', 'button primary', 'Save training profile'); save.type = 'submit';
-  add(form, status, save);
+  const error = node('p', 'form-error');
+  error.setAttribute('role', 'alert');
+  const save = button('Save training profile', { variant: 'primary', type: 'submit' });
+  add(form, error, add(node('div', 'form-row'), save));
   form.addEventListener('submit', async event => {
-    event.preventDefault(); status.textContent = ''; save.disabled = true;
-    try { await api('/api/training-profile', { method: 'POST', body: JSON.stringify(Object.fromEntries(Object.entries(fields).map(([key, input]) => [key, input.value.trim()]))) }); await refresh(); toast('Training profile saved', 'The assistant will use this context for future drafts.'); }
-    catch (error) { status.textContent = error.message; }
-    finally { save.disabled = false; }
+    event.preventDefault();
+    error.textContent = '';
+    setBusy(save, true);
+    try {
+      await api('/api/training-profile', { method: 'POST', body: JSON.stringify(Object.fromEntries(Object.entries(controls).map(([key, control]) => [key, control.value.trim()]))) });
+      form.dataset.dirty = 'false';
+      await refresh();
+      toast('Training profile saved', 'The assistant will use this context for future drafts.');
+    } catch (err) {
+      error.textContent = err.message;
+    } finally {
+      setBusy(save, false);
+    }
   });
-  return form;
+  const panel = node('section', 'panel profile-panel');
+  return add(panel, panelHeader('Training profile', 'Goals, equipment, constraints, and schedule for future drafts.'), form);
+}
+
+/* ----------------------------------------------------------------- the view */
+
+function assistantNotice(ctx) {
+  const { node, add } = ctx;
+  const body = add(node('div', 'notice-body'),
+    node('strong', '', 'Run the training assistant in a second terminal.'),
+    node('p', '', 'From the Corpus folder, run npm run assistant:codex or npm run assistant:claude. This opens a training session separate from developing Corpus. Review its drafts below.'),
+    node('p', 'note', 'Training data requested by the assistant is sent to your chosen AI provider.'));
+  return add(node('div', 'notice notice--info assistant-notice'), body);
 }
 
 export function renderProposals(ctx) {
-  const { state, node, add, refresh } = ctx;
+  const { state, node, add, refresh, button, heading, sectionHeading, emptyState, toast, format, setBusy } = ctx;
   const proposals = Array.isArray(state.proposals) ? state.proposals : [];
-  const view = node('section', 'view section-page proposals-view');
-  const refreshButton = button(node, 'Refresh drafts', async () => {
-    if (refreshButton.disabled) return;
-    refreshButton.disabled = true;
-    try { await refresh(); ctx.toast('Drafts refreshed', 'Proposal status is up to date.'); }
-    catch (error) { ctx.toast('Could not refresh drafts', error.message, 'error'); }
-    finally { refreshButton.disabled = false; }
-  }, 'button secondary');
-  add(view, add(node('header', 'view-header'), add(node('div', 'view-heading'), node('p', 'eyebrow', 'Training assistant workspace'), node('h1', '', 'AI drafts'), node('p', '', 'Review proposed routines and programs before anything is added to your local training archive.')), refreshButton));
-  const note = node('div', 'ai-workspace-note');
-  add(note, node('strong', '', 'Run the training assistant in a second terminal.'), node('p', '', 'From the Corpus folder, run npm run assistant:codex or npm run assistant:claude. This opens a training session separate from developing Corpus. Review its proposals below.'), node('p', 'field-hint', 'Training data requested by the assistant is sent to your chosen AI provider.'));
-  view.append(note);
-  const profilePanel = node('section', 'panel profile-panel');
-  add(profilePanel, add(node('header', 'panel-header'), add(node('div'), node('h2', '', 'Training profile'), node('p', '', 'Goals, equipment, constraints, and schedule for future drafts.'))), profileForm(ctx));
-  view.append(profilePanel);
-  const heading = node('header', 'panel-header proposals-heading');
-  add(heading, add(node('div'), node('h2', '', `${proposals.length} ${proposals.length === 1 ? 'draft' : 'drafts'}`), node('p', '', `${pendingCount(proposals)} awaiting review`)));
-  view.append(heading);
-  const grid = node('div', 'proposal-grid');
+  const view = node('section', 'view proposals-view');
+  const refreshButton = button('Refresh', {
+    icon: '↻',
+    onClick: async () => {
+      if (refreshButton.disabled) return;
+      setBusy(refreshButton, true);
+      try { await refresh(); }
+      catch (error) { toast('Couldn’t refresh drafts', error.message, 'error'); }
+      finally { setBusy(refreshButton, false); }
+    },
+  });
+  add(view,
+    heading('Workout', 'AI drafts', 'Review proposed routines and programs before anything is added to your local training archive.', refreshButton),
+    assistantNotice(ctx),
+    profilePanel(ctx),
+    sectionHeading(format.plural(proposals.length, 'draft'), `${pendingCount(proposals)} awaiting review`));
   const sorted = [...proposals].sort((a, b) => new Date(b.updated_at || b.created_at || 0) - new Date(a.updated_at || a.created_at || 0));
-  if (!sorted.length) grid.append(add(node('div', 'panel'), node('h2', '', 'No AI drafts yet'), node('p', '', 'Run the training assistant from the repository terminal to create a reviewable proposal.')));
-  else sorted.forEach(proposal => grid.append(renderProposalCard(ctx, proposal, item => openProposalDetail(ctx, item))));
+  if (!sorted.length) {
+    view.append(emptyState({
+      title: 'No AI drafts yet',
+      copy: 'Run the training assistant from the repository terminal to create a reviewable draft.',
+      icon: '✎',
+    }));
+    return view;
+  }
+  const grid = node('div', 'card-grid');
+  sorted.forEach(proposal => grid.append(renderProposalCard(ctx, proposal, item => openProposalDetail(ctx, item))));
   view.append(grid);
   return view;
 }

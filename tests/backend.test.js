@@ -41,6 +41,12 @@ test('defaults to isolated realistic demo data and persists private settings', a
   assert.deepEqual(after.settings, { unit: 'lb', hasApiKey: true, lastSync: null, googleHealth: { hasClient: false, connected: false, lastSync: null } });
   assert.equal((await stat(path.join(dataDir, 'settings.json'))).mode & 0o777, 0o600);
   await assert.rejects(service.saveSettings({ unit: 'stone' }), { code: 'validation' });
+  await service.saveSettings({ apiKey: '' });
+  assert.equal(service.getState().settings.hasApiKey, true, 'an empty key field keeps the stored key');
+  await service.saveSettings({ clearApiKey: true });
+  assert.equal(service.getState().settings.hasApiKey, false, 'clearApiKey forgets the stored key');
+  assert.equal(service.getState().workouts.length, 30, 'clearing the key keeps data');
+  await service.saveSettings({ apiKey: 'a-safe-test-key' });
 });
 
 test('sync paginates Hevy resources, is idempotent, and reconciles deletions', async (t) => {

@@ -482,6 +482,7 @@ export async function createService({ dataDir, fetchImpl = globalThis.fetch } = 
         if (key && (key.length < 8 || key.length > 1024)) throw new ServiceError('validation', 'API key has an invalid length.');
         if (key) next.apiKey = key; // An empty field deliberately preserves a stored key.
       }
+      if (body.clearApiKey === true) delete next.apiKey; // Explicit disconnect: forget the key, keep imported data.
       for (const [field, label] of [['googleClientId', 'Google client ID'], ['googleClientSecret', 'Google client secret']]) {
         if (body[field] === undefined) continue;
         const value = cleanText(body[field], 512, label);

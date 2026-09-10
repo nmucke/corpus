@@ -25,4 +25,5 @@ skills in the repository root's `.agents/skills` or `.claude/skills` directories
 - Keep assistant tool output concise and paginated. A skill is guidance, not an
   authorization mechanism; enforce write boundaries in code and launch settings.
 
-See `docs/architecture.md` and `docs/assistant.md` for the data and assistant flows.
+See `docs/architecture.md` and `docs/assistant.md` for the data and assistant flows, and
+`docs/ui.md` for the front-end conventions every view must follow.
