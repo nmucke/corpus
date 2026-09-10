@@ -7,10 +7,11 @@ corpus is a local-first training and health data workbench. The current release 
 - a routine builder that publishes new workouts to Hevy and edits existing routines;
 - an HTML overview with session, program, routine, and exercise views;
 - workout counts, duration, weekly trends, external-load volume, muscle distribution, and exercise progress;
-- a separate synthetic demo mode, kg/lb preferences, local settings, and Markdown export.
+- daily health metrics (activity, heart, sleep, body, and fitness) imported from Google Health, with a dashboard and trends view;
+- a separate synthetic demo mode, kg/lb preferences, local settings, and Markdown export;
 - an optional, tools-only training assistant that prepares local proposals for review.
 
-Future modules can add supplements, nutrition, body measurements, and a knowledge library without changing the local-only boundary.
+Future modules can add supplements, nutrition, and a knowledge library without changing the local-only boundary.
 
 The project is for personal use and for people who clone or fork the repository. It has no hosted service, account system, telemetry, CDN assets, cloud sync, or embedded AI model.
 
@@ -18,6 +19,7 @@ The project is for personal use and for people who clone or fork the repository.
 
 - Node.js 24 or newer
 - A Hevy Pro account and a Hevy API key for live imports
+- Optionally, a Google account with Fitbit or Google Health data and a personal Google Cloud OAuth client for health metrics
 
 The application has no npm runtime dependencies, so `npm install` is not needed. Node's built-in modules provide the server, local API, and database integration. On Node 24.11, starting or testing may print Node's experimental built-in SQLite warning; that warning is expected for this release.
 
@@ -117,9 +119,25 @@ Create a key in Hevy at <https://hevy.com/settings?developer>. The UI has a loca
 
 The first sync imports a complete paginated snapshot of workouts, routines, and exercise templates. Later manual syncs reconcile the snapshot in one SQLite transaction. Records that disappeared from Hevy are removed from the current imported dataset after a successful snapshot; exports are regenerated from that current dataset and do not provide deletion history. A separate synthetic demo dataset is available for screenshots and exploration; it is kept separate from live imported data and can be disabled before a real sync.
 
+## Google Health metrics
+
+Corpus imports daily health data through the Google Health API. Google Fit and the legacy Fitbit Web API are not used because both shut down in 2026. Setup uses a personal, unverified Google Cloud OAuth client:
+
+1. Create a project at <https://console.cloud.google.com/>.
+2. Enable the **Google Health API** in **APIs & Services → Library**.
+3. Configure the OAuth consent screen: user type **External**, publishing status **Testing**, and add your own Google account as a test user.
+4. Create an OAuth client under **Credentials → Create credentials → OAuth client ID** with application type **Desktop app**.
+5. Paste the client ID and client secret into **Settings → Google Health** in Corpus.
+6. Click **Connect**. A Google sign-in tab opens; approve the "unverified app" warning, which is expected for a personal app in Testing, and grant the read-only scopes. Google redirects back to the local server, and Settings shows the connection.
+7. Open **Metrics → Dashboard** and click **Sync Google Health**.
+
+Imported metrics: steps, distance, active zone minutes, energy burned, resting heart rate, heart rate variability, blood oxygen, sleep with deep/light/REM/awake stages, weight, body fat, and cardio fitness (VO₂ max). Sleep is dated by the morning you woke up. Weight follows your kg/lb preference.
+
+The first sync fetches the last year; later syncs re-fetch the last week so late-arriving data is picked up, and re-syncing never duplicates points. A successful sync switches Corpus to live mode. The client ID, secret, and OAuth tokens stay in `data/settings.json` in the local data directory; **Disconnect** revokes and forgets them. Demo mode shows generated metrics and never writes to the metric tables.
+
 ## Local data
 
-The default data directory is `data/`, which is ignored by git. It contains `data/corpus.sqlite`, the SQLite database for structured records, proposals, and sync metadata; generated Markdown under `data/exports/`; the credential-bearing `data/settings.json`; the local assistant credential; and proposal rationale files. Current Hevy workout, routine, and exercise-template table IDs are the corresponding Hevy IDs. Future connectors will need a deliberate namespaced-ID migration before adding other sources. A `data/knowledge/` convention may be introduced with the later knowledge module; it is not part of the current data model.
+The default data directory is `data/`, which is ignored by git. It contains `data/corpus.sqlite`, the SQLite database for structured records, proposals, and sync metadata; generated Markdown under `data/exports/`; the credential-bearing `data/settings.json` (Hevy key, Google Health client and tokens); the local assistant credential; and proposal rationale files. Current Hevy workout, routine, and exercise-template table IDs are the corresponding Hevy IDs, and a second workout source would need a deliberate namespaced-ID migration. Health metric points are already namespaced by source. A `data/knowledge/` convention may be introduced with the later knowledge module; it is not part of the current data model.
 
 To make a backup, stop corpus and copy the entire data directory to a protected location. The copy includes the local credential and should be treated as sensitive.
 
@@ -132,4 +150,4 @@ access, or SQL. Corpus itself makes no AI-provider request. A chosen native CLI
 may send the bounded context it receives to that CLI's provider; the launcher
 states this before it starts a session.
 
-The architecture is documented in [docs/architecture.md](docs/architecture.md). It keeps workouts, nutrition, supplements, and knowledge as separate modules so each can be added one at a time. Cloud storage can be added later only through an explicit opt-in migration with a clear data contract; it is not promised by the current local setup.
+The architecture is documented in [docs/architecture.md](docs/architecture.md). It keeps workouts, health metrics, nutrition, supplements, and knowledge as separate modules so each can be added one at a time. Cloud storage can be added later only through an explicit opt-in migration with a clear data contract; it is not promised by the current local setup.

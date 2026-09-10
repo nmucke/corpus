@@ -20,11 +20,23 @@
         </div>
 
         <nav class="primary-nav">
-          <a href="#overview" data-route="overview" class="is-active"><span class="nav-icon" aria-hidden="true">⌂</span>Overview</a>
-          <a href="#sessions" data-route="sessions"><span class="nav-icon" aria-hidden="true">◫</span>Sessions</a>
-          <a href="#programs" data-route="programs"><span class="nav-icon" aria-hidden="true">≡</span>Programs</a>
-          <a href="#proposals" data-route="proposals"><span class="nav-icon" aria-hidden="true">✦</span><span>AI drafts</span><span class="nav-count" id="proposals-badge" hidden aria-label="Pending AI drafts"></span></a>
-          <a href="#exercises" data-route="exercises"><span class="nav-icon" aria-hidden="true">↗</span>Exercises</a>
+          <details class="nav-group" open>
+            <summary><span class="nav-icon" aria-hidden="true">◫</span>Workout<span class="nav-chevron" aria-hidden="true">›</span></summary>
+            <div class="nav-group-links">
+              <a href="#overview" data-route="overview" class="is-active">Overview</a>
+              <a href="#sessions" data-route="sessions">Sessions</a>
+              <a href="#programs" data-route="programs">Programs</a>
+              <a href="#exercises" data-route="exercises">Exercises</a>
+              <a href="#proposals" data-route="proposals"><span>AI drafts</span><span class="nav-count" id="proposals-badge" hidden aria-label="Pending AI drafts"></span></a>
+            </div>
+          </details>
+          <details class="nav-group" open>
+            <summary><span class="nav-icon" aria-hidden="true">∿</span>Metrics<span class="nav-chevron" aria-hidden="true">›</span></summary>
+            <div class="nav-group-links">
+              <a href="#metrics" data-route="metrics">Dashboard</a>
+              <a href="#metrics-trends" data-route="metrics-trends">Trends</a>
+            </div>
+          </details>
           <a href="#settings" data-route="settings"><span class="nav-icon" aria-hidden="true">⚙</span>Settings</a>
         </nav>
 

@@ -35,6 +35,21 @@ async function body(req, maximum = 65536) {
   }
 }
 
+function escapeHtml(value) { return String(value).replace(/[&<>"']/g, (char) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[char])); }
+
+async function googleCallbackPage(service, url, res) {
+  let status = 200; let message = 'Google Health is connected. You can close this tab and return to Corpus.';
+  try {
+    await service.googleHealthCallback({ code: url.searchParams.get('code') ?? '', state: url.searchParams.get('state') ?? '' });
+  } catch (error) {
+    const code = error.status || error.statusCode;
+    status = Number.isInteger(code) && code >= 400 && code <= 599 ? code : 400;
+    message = error.message || 'Google Health could not be connected.';
+  }
+  res.writeHead(status, { 'Content-Type': 'text/html; charset=utf-8' });
+  res.end(`<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Corpus</title><style>body{font-family:system-ui,sans-serif;background:#f6f5f2;color:#1f2933;display:grid;place-items:center;min-height:100vh;margin:0}main{max-width:28rem;padding:2rem;text-align:center}h1{font-size:1.25rem;margin:0 0 .75rem}p{margin:0;line-height:1.5}</style></head><body><main><h1>Corpus</h1><p>${escapeHtml(message)}</p></main></body></html>`);
+}
+
 export function createApp(service, { assistantToken = null } = {}) {
   const sessions = browserSessions();
   return http.createServer(async (req, res) => {
@@ -44,12 +59,15 @@ export function createApp(service, { assistantToken = null } = {}) {
     res.setHeader('Content-Security-Policy', "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; font-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'");
     const port = req.socket.localPort;
     const hosts = new Set([`127.0.0.1:${port}`, `localhost:${port}`]);
-    if (!hosts.has(req.headers.host) || (req.headers.origin && req.headers.origin !== `http://${req.headers.host}`) || req.headers['sec-fetch-site'] === 'cross-site') {
-      return json(res, 403, { error: 'Corpus only accepts requests from its local interface.' });
-    }
+    const foreign = () => json(res, 403, { error: 'Corpus only accepts requests from its local interface.' });
+    if (!hosts.has(req.headers.host)) return foreign();
     try {
       const url = new URL(req.url, `http://${req.headers.host}`);
       const path = url.pathname;
+      // The OAuth loopback redirect is a top-level navigation from Google, so
+      // it is exempt from the origin check; the single-use state protects it.
+      if (req.method === 'GET' && path === '/api/metrics/google/callback') return googleCallbackPage(service, url, res);
+      if ((req.headers.origin && req.headers.origin !== `http://${req.headers.host}`) || req.headers['sec-fetch-site'] === 'cross-site') return foreign();
       if (path.startsWith('/api/assistant/')) {
         const token = req.headers.authorization?.match(/^Bearer ([^\s]+)$/)?.[1];
         if (!equalToken(token, assistantToken)) return json(res, 401, { error: 'A valid Corpus assistant credential is required.', code: 'assistant_unauthorized' });
@@ -76,11 +94,15 @@ export function createApp(service, { assistantToken = null } = {}) {
         return json(res, 200, result);
       }
       if (req.method === 'GET' && path === '/api/state') return json(res, 200, await service.getState());
+      if (req.method === 'GET' && path === '/api/metrics') return json(res, 200, await service.getMetrics({ days: url.searchParams.has('days') ? Number(url.searchParams.get('days')) : 90 }));
       if (req.method === 'POST') {
         const payload = await body(req);
         let result;
         if (path === '/api/settings') result = await service.saveSettings(payload);
         else if (path === '/api/sync') result = await service.sync();
+        else if (path === '/api/metrics/sync') result = await service.syncMetrics();
+        else if (path === '/api/metrics/google/connect') result = await service.googleHealthConnect({ redirectUri: `http://${req.headers.host}/api/metrics/google/callback` });
+        else if (path === '/api/metrics/google/disconnect') result = await service.googleHealthDisconnect();
         else if (path === '/api/demo') {
           if (typeof payload.enabled !== 'boolean') throw Object.assign(new Error('enabled must be a boolean.'), { status: 400 });
           result = await service.setDemo(payload.enabled);

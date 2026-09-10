@@ -8,6 +8,7 @@ import {
   weeklySeries,
   workoutVolume,
 } from "./analytics.js";
+import { renderMetricsDashboard, renderMetricsTrends } from "./metrics.js";
 import { renderPrograms as renderProgramsModule, renderProgramProgress } from "./programs.js";
 import { matchingPrograms, programTimeline } from "./program-timeline.js";
 import { pendingCount, renderProposals } from "./proposals.js";
@@ -116,7 +117,7 @@ function dateLabel(value, options = { month: "short", day: "numeric" }) {
 }
 function route() {
   const value = location.hash.slice(1).split("/")[0];
-  return ["overview", "sessions", "programs", "proposals", "exercises", "settings"].includes(value) ? value : "overview";
+  return ["overview", "sessions", "programs", "proposals", "exercises", "metrics", "metrics-trends", "settings"].includes(value) ? value : "overview";
 }
 
 function heading(eyebrow, title, description, action) {
@@ -560,6 +561,7 @@ function updateChrome() {
   syncButton.disabled = false;
   syncButton.title = state.settings.hasApiKey ? "Sync your Hevy archive" : "Add your Hevy API key in Settings to sync";
   document.querySelectorAll("[data-route]").forEach((link) => link.classList.toggle("is-active", link.dataset.route === route()));
+  document.querySelectorAll(".nav-group").forEach((group) => { if (group.querySelector(`[data-route="${route()}"]`)) group.open = true; });
   const badge = document.querySelector("#proposals-badge");
   const count = pendingCount(state.proposals || []);
   if (badge) { badge.textContent = count ? String(count) : ""; badge.hidden = !count; }
@@ -585,6 +587,8 @@ function render() {
     case "programs": view = renderProgramsModule(context()); break;
     case "proposals": view = renderProposals(context()); break;
     case "exercises": view = renderExercises(); break;
+    case "metrics": view = renderMetricsDashboard(context()); break;
+    case "metrics-trends": view = renderMetricsTrends(context()); break;
     case "settings": view = renderSettingsModule(context()); break;
     default: view = renderOverview();
   }
@@ -610,6 +614,7 @@ async function loadState() {
   state.proposals ||= [];
   state.trainingProfile ||= { goals: "", equipment: "", constraints: "", schedule: "" };
   state.settings ||= { unit: "kg", hasApiKey: false, lastSync: null };
+  state.settings.googleHealth ||= { hasClient: false, connected: false, lastSync: null };
   render();
   return state;
 }

@@ -5,11 +5,18 @@ import { createHash, randomUUID } from 'node:crypto';
 import { demoState } from './demo.js';
 import { fetchSnapshot, postRoutine, updateRoutine as putRoutine, ROUTINE_UNCERTAIN_MESSAGE, ROUTINE_UPDATE_UNCERTAIN_MESSAGE } from './hevy.js';
 import { programTimeline, validateProgramSchedule } from '../public/program-timeline.js';
+import { METRICS, METRIC_KEYS, isMetricKey } from '../public/metrics-catalog.js';
 import { entityHash, proposalDraft, publicProposal } from './proposals.js';
+import { demoMetricSeries } from './metrics-demo.js';
+import { SCOPES, GoogleHealthError, pkcePair, authorizationUrl, exchangeCode, refreshAccessToken, revokeToken, fetchMetricPoints } from './google-health.js';
 
 export { entityHash } from './proposals.js';
 
-const SCHEMA_VERSION = 5;
+const SCHEMA_VERSION = 6;
+const GOOGLE_SOURCE = 'google-health';
+const OAUTH_PENDING_MS = 10 * 60 * 1000;
+const METRICS_FIRST_SYNC_DAYS = 365;
+const METRICS_RESYNC_DAYS = 7;
 const PROGRAM_TITLE_MAX = 160;
 const PROGRAM_DESCRIPTION_MAX = 4000;
 
@@ -34,6 +41,17 @@ function cleanText(value, max, name, required = false) {
 }
 function isoNow() { return new Date().toISOString(); }
 function safeId(value) { return typeof value === 'string' && value.length > 0 && value.length <= 255; }
+const DAY_MS = 86_400_000;
+// Metric dates are civil dates: the server's local calendar day, shifted in UTC
+// arithmetic so daylight-saving changes cannot skip or repeat a day.
+function localDate(now = new Date()) { return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`; }
+function isDateString(value) { return typeof value === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(value) && !Number.isNaN(Date.parse(`${value}T00:00:00Z`)); }
+function addDays(date, days) { return new Date(Date.parse(`${date}T00:00:00Z`) + days * DAY_MS).toISOString().slice(0, 10); }
+function clampDays(days) {
+  const value = Number(days);
+  if (!Number.isFinite(value)) return 90;
+  return Math.min(730, Math.max(7, Math.trunc(value)));
+}
 
 function programSchedule(startDate, durationWeeks) {
   const schedule = validateProgramSchedule(startDate, durationWeeks);
@@ -72,7 +90,10 @@ function initialise(db) {
     CREATE TABLE IF NOT EXISTS proposals (id TEXT PRIMARY KEY, revision INTEGER NOT NULL, mode TEXT NOT NULL, status TEXT NOT NULL CHECK(status IN ('draft','revision_requested','accepted','declined')), title TEXT NOT NULL, rationale TEXT NOT NULL, routines_json TEXT NOT NULL, programs_json TEXT NOT NULL, feedback TEXT, result_json TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS proposal_history (proposal_id TEXT NOT NULL REFERENCES proposals(id) ON DELETE CASCADE, revision INTEGER NOT NULL, status TEXT NOT NULL, title TEXT NOT NULL, rationale TEXT NOT NULL, routines_json TEXT NOT NULL, programs_json TEXT NOT NULL, feedback TEXT, result_json TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, PRIMARY KEY(proposal_id, revision));
     CREATE TABLE IF NOT EXISTS proposal_requests (request_id TEXT PRIMARY KEY, payload_hash TEXT NOT NULL, proposal_id TEXT NOT NULL REFERENCES proposals(id) ON DELETE CASCADE, revision INTEGER NOT NULL, created_at TEXT NOT NULL);
-    CREATE TABLE IF NOT EXISTS training_profiles (mode TEXT PRIMARY KEY, goals TEXT NOT NULL, equipment TEXT NOT NULL, constraints TEXT NOT NULL, schedule TEXT NOT NULL, updated_at TEXT NOT NULL);`);
+    CREATE TABLE IF NOT EXISTS training_profiles (mode TEXT PRIMARY KEY, goals TEXT NOT NULL, equipment TEXT NOT NULL, constraints TEXT NOT NULL, schedule TEXT NOT NULL, updated_at TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS metric_sources (id TEXT PRIMARY KEY, kind TEXT NOT NULL, label TEXT NOT NULL, cursor_json TEXT, last_sync TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS metric_points (source TEXT NOT NULL REFERENCES metric_sources(id) ON DELETE CASCADE, metric TEXT NOT NULL, source_id TEXT NOT NULL, date TEXT NOT NULL, start_time TEXT, end_time TEXT, value REAL NOT NULL, raw_json TEXT, imported_at TEXT NOT NULL, PRIMARY KEY(source, metric, source_id));
+    CREATE INDEX IF NOT EXISTS metric_points_by_metric_date ON metric_points(metric, date);`);
   const programColumns = new Set(db.prepare('PRAGMA table_info(programs)').all().map((column) => column.name));
   const mappingColumns = new Set(db.prepare('PRAGMA table_info(local_routine_mappings)').all().map((column) => column.name));
   const needsMigration = !version || Number(version) < SCHEMA_VERSION || !programColumns.has('start_date') || !programColumns.has('duration_weeks') || !mappingColumns.has('result_json');
@@ -347,6 +368,27 @@ function markdownFor(state) {
   return { 'workouts.md': workoutLines.join('\n'), 'routines.md': routineLines.join('\n'), 'overview.md': overviewLines.join('\n'), 'programs.md': programLines.join('\n') };
 }
 
+function metricsMarkdown(metrics) {
+  const lines = ['# Health metrics', ''];
+  if (metrics.mode === 'demo') lines.push('> **Demo data** — this export contains deterministic sample health metrics.', '');
+  lines.push(`- Range: ${metrics.range.from} to ${metrics.range.to}`, '- Sources:');
+  if (!metrics.sources.length) lines.push('  - None connected');
+  for (const source of metrics.sources) lines.push(`  - ${source.label} (${source.kind}): last sync ${source.lastSync || 'never'}, synced through ${source.syncedThrough || 'n/a'}`);
+  const present = METRICS.filter((metric) => metrics.series[metric.key].length);
+  const format = (metric, value) => value.toFixed(metric.decimals);
+  lines.push('', '## Latest', '');
+  if (!present.length) lines.push('- No data yet');
+  for (const metric of present) { const last = metrics.series[metric.key].at(-1); lines.push(`- ${metric.label}: ${format(metric, last.value)} ${metric.unit} (${last.date})`); }
+  lines.push('', '## Daily', '');
+  if (present.length) {
+    const byDate = new Map();
+    for (const metric of present) for (const point of metrics.series[metric.key]) { if (!byDate.has(point.date)) byDate.set(point.date, {}); byDate.get(point.date)[metric.key] = point.value; }
+    lines.push(`| Date | ${present.map((metric) => `${metric.label} (${metric.unit})`).join(' | ')} |`, `| --- | ${present.map(() => '---').join(' | ')} |`);
+    for (const date of [...byDate.keys()].sort()) lines.push(`| ${date} | ${present.map((metric) => byDate.get(date)[metric.key] == null ? '' : format(metric, byDate.get(date)[metric.key])).join(' | ')} |`);
+  }
+  return lines.join('\n');
+}
+
 export async function createService({ dataDir, fetchImpl = globalThis.fetch } = {}) {
   if (!dataDir || typeof dataDir !== 'string') throw new TypeError('dataDir is required.');
   const createdDataDir = await mkdir(dataDir, { recursive: true, mode: 0o700 });
@@ -358,6 +400,8 @@ export async function createService({ dataDir, fetchImpl = globalThis.fetch } = 
   const settingsFile = path.join(dataDir, 'settings.json');
   let privateSettings = await readPrivateSettings(settingsFile);
   let syncPromise = null;
+  let metricsSyncPromise = null;
+  let pendingOauth = null; // { state, verifier, redirectUri, expires } for the single in-flight Google sign-in
   let writeQueue = Promise.resolve();
   const serialiseWrite = (work) => {
     const result = writeQueue.then(work, work);
@@ -369,7 +413,39 @@ export async function createService({ dataDir, fetchImpl = globalThis.fetch } = 
   const setMeta = (key, value) => db.prepare('INSERT INTO meta(key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value').run(key, value);
   const activeKey = () => process.env.HEVY_API_KEY || privateSettings.apiKey || null;
   const mode = () => getMeta('mode') === 'live' ? 'live' : 'demo';
-  const publicSettings = () => ({ unit: privateSettings.unit === 'lb' ? 'lb' : 'kg', hasApiKey: Boolean(activeKey()), lastSync: getMeta('last_sync') });
+  const googleClient = () => (privateSettings.googleClientId && privateSettings.googleClientSecret ? { clientId: privateSettings.googleClientId, clientSecret: privateSettings.googleClientSecret } : null);
+  const googleTokens = () => (privateSettings.googleHealth?.accessToken && privateSettings.googleHealth?.refreshToken ? privateSettings.googleHealth : null);
+  const publicSettings = () => ({ unit: privateSettings.unit === 'lb' ? 'lb' : 'kg', hasApiKey: Boolean(activeKey()), lastSync: getMeta('last_sync'), googleHealth: { hasClient: Boolean(googleClient()), connected: Boolean(googleTokens()), lastSync: db.prepare('SELECT last_sync FROM metric_sources WHERE id = ?').get(GOOGLE_SOURCE)?.last_sync ?? null } });
+  const saveGoogleTokens = async (tokens) => {
+    const next = { ...privateSettings };
+    if (tokens) next.googleHealth = tokens; else delete next.googleHealth;
+    await writePrivateSettings(settingsFile, next);
+    privateSettings = next;
+  };
+  const googleError = (error) => (error instanceof GoogleHealthError
+    ? new ServiceError(error.code, error.message, { unauthorized: 401, rate_limited: 429, network: 503 }[error.code] ?? 502)
+    : error);
+  const notConnected = () => new ServiceError('not_connected', 'Google Health needs to be reconnected.', 401);
+  const metricSources = () => db.prepare('SELECT id, kind, label, cursor_json, last_sync FROM metric_sources ORDER BY created_at, id').all().map((row) => {
+    let cursor = null;
+    try { cursor = row.cursor_json ? parse(row.cursor_json) : null; } catch { /* treat an unreadable cursor as no cursor */ }
+    return { id: row.id, kind: row.kind, label: row.label, lastSync: row.last_sync, syncedThrough: isDateString(cursor?.syncedThrough) ? cursor.syncedThrough : null };
+  });
+  const metrics = ({ days = 90 } = {}) => {
+    const count = clampDays(days); const currentMode = mode();
+    const to = localDate(); const from = addDays(to, -(count - 1));
+    let series;
+    if (currentMode === 'demo') series = demoMetricSeries(from, to);
+    else {
+      series = Object.fromEntries(METRIC_KEYS.map((key) => [key, []]));
+      const aggregate = new Map(METRICS.map((metric) => [metric.key, metric.aggregate]));
+      for (const row of db.prepare('SELECT metric, date, SUM(value) AS total, AVG(value) AS mean FROM metric_points WHERE date >= ? AND date <= ? GROUP BY metric, date ORDER BY metric, date').all(from, to)) {
+        if (!series[row.metric]) continue;
+        series[row.metric].push({ date: row.date, value: Math.round((aggregate.get(row.metric) === 'mean' ? row.mean : row.total) * 1000) / 1000 });
+      }
+    }
+    return { mode: currentMode, range: { from, to }, sources: metricSources(), series };
+  };
   const programs = (currentMode) => db.prepare('SELECT id, title, description, days_json, start_date, duration_weeks, created_at, updated_at FROM programs WHERE mode = ? ORDER BY created_at').all(currentMode).map(({ days_json, ...program }) => ({ ...program, days: parse(days_json) }));
   const visibleRoutines = (currentMode) => {
     const base = currentMode === 'demo' ? demoState().routines : db.prepare('SELECT raw_json FROM routines ORDER BY title, id').all().map((row) => parse(row.raw_json));
@@ -406,9 +482,107 @@ export async function createService({ dataDir, fetchImpl = globalThis.fetch } = 
         if (key && (key.length < 8 || key.length > 1024)) throw new ServiceError('validation', 'API key has an invalid length.');
         if (key) next.apiKey = key; // An empty field deliberately preserves a stored key.
       }
+      for (const [field, label] of [['googleClientId', 'Google client ID'], ['googleClientSecret', 'Google client secret']]) {
+        if (body[field] === undefined) continue;
+        const value = cleanText(body[field], 512, label);
+        if (value) next[field] = value; // Empty fields preserve stored credentials, like the API key.
+      }
       await writePrivateSettings(settingsFile, next);
       privateSettings = next;
       return publicSettings();
+    },
+    getMetrics: metrics,
+    async googleHealthConnect({ redirectUri } = {}) {
+      const client = googleClient();
+      if (!client) throw new ServiceError('no_google_client', 'Add a Google OAuth client ID and secret in Settings before connecting.');
+      if (typeof redirectUri !== 'string' || !/^http:\/\/(127\.0\.0\.1|localhost):\d{1,5}\/api\/metrics\/google\/callback$/.test(redirectUri)) throw new ServiceError('validation', 'The Google redirect URI must be this local Corpus callback.');
+      const { verifier, challenge } = pkcePair();
+      const state = randomUUID();
+      pendingOauth = { state, verifier, redirectUri, expires: Date.now() + OAUTH_PENDING_MS };
+      return { url: authorizationUrl({ clientId: client.clientId, redirectUri, state, codeChallenge: challenge }) };
+    },
+    async googleHealthCallback({ code, state } = {}) {
+      return serialiseWrite(async () => {
+        if (pendingOauth && pendingOauth.expires < Date.now()) pendingOauth = null;
+        if (!pendingOauth || typeof state !== 'string' || state !== pendingOauth.state) throw new ServiceError('oauth_state', 'This Google sign-in link is invalid or has expired. Start again from Settings.', 400);
+        const pending = pendingOauth; pendingOauth = null; // the state is single-use
+        if (typeof code !== 'string' || !code) throw new ServiceError('validation', 'Google did not return an authorization code.', 400);
+        const client = googleClient();
+        if (!client) throw new ServiceError('no_google_client', 'Add a Google OAuth client ID and secret in Settings before connecting.');
+        let tokens;
+        try { tokens = await exchangeCode(fetchImpl, { ...client, code, codeVerifier: pending.verifier, redirectUri: pending.redirectUri }); } catch (error) { throw googleError(error); }
+        const refreshToken = tokens?.refreshToken || privateSettings.googleHealth?.refreshToken;
+        if (!tokens?.accessToken || !refreshToken) throw new ServiceError('oauth', 'Google did not return usable tokens. Remove Corpus from your Google account and connect again.', 502);
+        await saveGoogleTokens({ accessToken: tokens.accessToken, refreshToken, expiresAt: tokens.expiresAt ?? null, scope: tokens.scope ?? SCOPES.join(' '), connectedAt: isoNow() });
+        const now = isoNow();
+        db.prepare('INSERT INTO metric_sources(id, kind, label, cursor_json, last_sync, created_at, updated_at) VALUES (?, ?, ?, NULL, NULL, ?, ?) ON CONFLICT(id) DO UPDATE SET kind=excluded.kind, label=excluded.label, updated_at=excluded.updated_at').run(GOOGLE_SOURCE, 'api', 'Google Health', now, now);
+        return { connected: true };
+      });
+    },
+    async googleHealthDisconnect() {
+      return serialiseWrite(async () => {
+        const tokens = privateSettings.googleHealth;
+        if (tokens?.refreshToken || tokens?.accessToken) { try { await revokeToken(fetchImpl, tokens.refreshToken || tokens.accessToken); } catch { /* best effort */ } }
+        await saveGoogleTokens(null);
+        return publicSettings();
+      });
+    },
+    async syncMetrics() {
+      if (metricsSyncPromise) return metricsSyncPromise;
+      if (!googleTokens()) throw new ServiceError('not_connected', 'Connect Google Health in Settings before syncing.', 400);
+      metricsSyncPromise = serialiseWrite(async () => {
+        const client = googleClient();
+        if (!client) throw new ServiceError('no_google_client', 'Add a Google OAuth client ID and secret in Settings before syncing.');
+        let tokens = googleTokens();
+        if (!tokens) throw notConnected();
+        const disconnect = async () => { await saveGoogleTokens(null); return notConnected(); };
+        // A refresh that Google rejects means the grant is gone (revoked, or the
+        // test-user consent expired); a transient token failure keeps the grant.
+        const refresh = async (afterUnauthorized = false) => {
+          let fresh;
+          try { fresh = await refreshAccessToken(fetchImpl, { ...client, refreshToken: tokens.refreshToken }); } catch (error) {
+            if (error instanceof GoogleHealthError && (error.code === 'unauthorized' || (error.code === 'oauth' && (afterUnauthorized || /invalid_grant/.test(error.message))))) throw await disconnect();
+            throw googleError(error);
+          }
+          if (!fresh?.accessToken) throw await disconnect();
+          tokens = { ...tokens, accessToken: fresh.accessToken, refreshToken: fresh.refreshToken || tokens.refreshToken, expiresAt: fresh.expiresAt ?? null, scope: fresh.scope ?? tokens.scope };
+          await saveGoogleTokens(tokens);
+        };
+        if (!tokens.expiresAt || Date.parse(tokens.expiresAt) - Date.now() < 60_000) await refresh();
+        const to = localDate();
+        const cursor = metricSources().find((source) => source.id === GOOGLE_SOURCE)?.syncedThrough;
+        const from = cursor ? addDays(cursor < to ? cursor : to, -METRICS_RESYNC_DAYS) : addDays(to, -METRICS_FIRST_SYNC_DAYS);
+        let result;
+        try { result = await fetchMetricPoints(fetchImpl, tokens.accessToken, { from, to }); } catch (error) {
+          if (!(error instanceof GoogleHealthError) || error.code !== 'unauthorized') throw googleError(error);
+          await refresh(true);
+          try { result = await fetchMetricPoints(fetchImpl, tokens.accessToken, { from, to }); } catch (retryError) {
+            if (retryError instanceof GoogleHealthError && retryError.code === 'unauthorized') throw await disconnect();
+            throw googleError(retryError);
+          }
+        }
+        const points = (Array.isArray(result?.points) ? result.points : []).filter((point) => point && isMetricKey(point.metric) && safeId(point.sourceId) && isDateString(point.date) && typeof point.value === 'number' && Number.isFinite(point.value));
+        const warnings = Array.isArray(result?.warnings) ? result.warnings.map(String) : [];
+        const failed = Array.isArray(result?.failed) ? result.failed.map(String) : [];
+        const now = isoNow();
+        try {
+          db.exec('BEGIN IMMEDIATE');
+          db.prepare('INSERT INTO metric_sources(id, kind, label, cursor_json, last_sync, created_at, updated_at) VALUES (?, ?, ?, NULL, NULL, ?, ?) ON CONFLICT(id) DO NOTHING').run(GOOGLE_SOURCE, 'api', 'Google Health', now, now);
+          const upsert = db.prepare('INSERT INTO metric_points(source, metric, source_id, date, start_time, end_time, value, raw_json, imported_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(source, metric, source_id) DO UPDATE SET date=excluded.date, start_time=excluded.start_time, end_time=excluded.end_time, value=excluded.value, raw_json=excluded.raw_json, imported_at=excluded.imported_at');
+          for (const point of points) upsert.run(GOOGLE_SOURCE, point.metric, point.sourceId, point.date, valueOrNull(point.startTime), valueOrNull(point.endTime), point.value, point.raw == null ? null : json(point.raw), now);
+          // A sync in which any data type's request failed keeps its cursor, so
+          // the next sync re-fetches the same range instead of leaving gaps behind.
+          if (failed.length) db.prepare('UPDATE metric_sources SET last_sync = ?, updated_at = ? WHERE id = ?').run(now, now, GOOGLE_SOURCE);
+          else db.prepare('UPDATE metric_sources SET cursor_json = ?, last_sync = ?, updated_at = ? WHERE id = ?').run(json({ syncedThrough: to }), now, now, GOOGLE_SOURCE);
+          setMeta('mode', 'live');
+          db.exec('COMMIT');
+        } catch (error) {
+          try { db.exec('ROLLBACK'); } catch { /* no transaction to roll back */ }
+          throw error;
+        }
+        return { ...metrics({ days: 90 }), imported: points.length, warnings };
+      });
+      try { return await metricsSyncPromise; } finally { metricsSyncPromise = null; }
     },
     async sync() {
       if (syncPromise) return syncPromise;
@@ -723,7 +897,7 @@ export async function createService({ dataDir, fetchImpl = globalThis.fetch } = 
     async exportMarkdown() {
       const exportDir = path.join(dataDir, 'exports');
       await mkdir(exportDir, { recursive: true });
-      const contents = markdownFor(state()); const files = [];
+      const contents = { ...markdownFor(state()), 'metrics.md': metricsMarkdown(metrics({ days: 90 })) }; const files = [];
       for (const [name, contentsForFile] of Object.entries(contents)) {
         const target = path.join(exportDir, name); const temp = `${target}.${process.pid}.${randomUUID()}.tmp`;
         await writeFile(temp, `${contentsForFile}\n`, 'utf8'); await rename(temp, target); files.push(`exports/${name}`);

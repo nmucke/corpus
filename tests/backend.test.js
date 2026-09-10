@@ -38,7 +38,7 @@ test('defaults to isolated realistic demo data and persists private settings', a
   assert.equal(before.routines.length, 4);
   await service.saveSettings({ apiKey: 'a-safe-test-key', unit: 'lb' });
   const after = service.getState();
-  assert.deepEqual(after.settings, { unit: 'lb', hasApiKey: true, lastSync: null });
+  assert.deepEqual(after.settings, { unit: 'lb', hasApiKey: true, lastSync: null, googleHealth: { hasClient: false, connected: false, lastSync: null } });
   assert.equal((await stat(path.join(dataDir, 'settings.json'))).mode & 0o777, 0o600);
   await assert.rejects(service.saveSettings({ unit: 'stone' }), { code: 'validation' });
 });
@@ -121,7 +121,7 @@ test('programs remain scoped to the selected data mode and export has no secret'
   assert.equal(service.getState().programs.length, 1);
   await service.saveSettings({ apiKey: 'private-test-secret' });
   const result = await service.exportMarkdown();
-  assert.deepEqual(result.files, ['exports/workouts.md', 'exports/routines.md', 'exports/overview.md', 'exports/programs.md']);
+  assert.deepEqual(result.files, ['exports/workouts.md', 'exports/routines.md', 'exports/overview.md', 'exports/programs.md', 'exports/metrics.md']);
   const output = await readFile(path.join(dataDir, 'exports', 'overview.md'), 'utf8');
   assert.match(output, /Demo data/);
   assert.doesNotMatch(output, /private-test-secret/);
