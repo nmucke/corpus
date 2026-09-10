@@ -84,6 +84,14 @@
   --halo-live: rgba(63, 122, 81, 0.13);
   --focus-glow: 0 0 0 3px rgba(145, 189, 54, 0.12);
   --drawer-shadow: 20px 0 50px rgba(7, 22, 13, 0.23);
+  /* heart-rate zone ramp (data viz, ordinal: one hue, light → dark, validated
+     for monotone lightness, step separation and light-end contrast). `none` is
+     absence rather than a zone, so it takes the recessive ground. */
+  --zone-fat-burn: #e5a14a;
+  --zone-cardio: #c8761f;
+  --zone-peak: #8d4412;
+  --zone-none: var(--surface-3);
+
   /* muscle-map intensity ramp (data viz, 0 = untrained → 4 = highest) */
   --map-0: #d5d9d3; --map-0-line: #a2ab9f;
   --map-1: #d7e9a9; --map-1-line: #9bb75f;
@@ -959,6 +967,53 @@ details[open] .disclosure-chevron { transform: rotate(90deg); }
 .chart-legend i.sleep-awake { background: var(--warn); opacity: 0.6; }
 .chart-wrap .metric-legend { justify-content: flex-end; margin-top: 10px; }
 
+/* Peer series on the one y-axis: the peak line always brings a legend entry. */
+.chart-line--peak { stroke: var(--zone-peak); }
+.chart-dot--peak { fill: var(--zone-peak); stroke: var(--surface-1); }
+.chart-legend i.legend-line--peak { border-top-color: var(--zone-peak); }
+
+/* Heart-rate zones — the one place colour carries meaning in these views. The
+   SVG stack paints with `fill`, the legend swatch and the bar with `background`. */
+.chart-bar.zone--fat-burn { fill: var(--zone-fat-burn); }
+.chart-bar.zone--cardio { fill: var(--zone-cardio); }
+.chart-bar.zone--peak { fill: var(--zone-peak); }
+.chart-legend i.zone--fat-burn, .zone-fill.zone--fat-burn { background: var(--zone-fat-burn); }
+.chart-legend i.zone--cardio, .zone-fill.zone--cardio { background: var(--zone-cardio); }
+.chart-legend i.zone--peak, .zone-fill.zone--peak { background: var(--zone-peak); }
+.chart-legend i.zone--none, .zone-fill.zone--none { background: var(--zone-none); }
+
+/* Intra-workout trace: estimated exercise bands, the logged start/end rules and
+   the hover layer that reports one sample. */
+.chart-band { fill: var(--surface-2); }
+.chart-band.is-alt { fill: var(--surface-3); }
+.chart-band-label { fill: var(--text-3); }
+.chart-rule { stroke: var(--text-3); stroke-width: 1; stroke-dasharray: 4 3; }
+.chart-line-point { fill: var(--lime-dark); }
+.chart-hover-layer { fill: transparent; cursor: crosshair; }
+.chart-crosshair { stroke: var(--text-2); stroke-width: 1; pointer-events: none; }
+.chart-focus-dot { fill: var(--forest); stroke: var(--surface-1); stroke-width: 2; pointer-events: none; }
+.chart-readout {
+  min-height: 20px;
+  margin: 8px 0 0;
+  color: var(--text-3);
+  font-size: var(--fs-200);
+  font-variant-numeric: tabular-nums;
+}
+.chart-readout.is-live { color: var(--text-1); font-weight: 700; }
+
+/* One horizontal stack: the bar is decorative, the legend carries the minutes. */
+.zone-bar-block { display: grid; gap: 9px; }
+.zone-bar {
+  display: flex;
+  gap: 2px;
+  height: 12px;
+  overflow: hidden;
+  border-radius: var(--r-pill);
+  background: var(--surface-3);
+}
+.zone-fill { min-width: 3px; }
+.zone-legend { gap: 6px 14px; }
+
 /* ===== Overview ===== */
 .stat-card { position: relative; min-height: 132px; overflow: hidden; }
 .stat-card::after {
@@ -1380,6 +1435,34 @@ details[open] .disclosure-chevron { transform: rotate(90deg); }
 .metrics-table .sets-table th { position: sticky; top: 0; background: var(--surface-1); }
 /* A range change keeps the rendered body and dims it until fresh data lands (DASH-8). */
 .is-refreshing { opacity: 0.6; transition: opacity 160ms ease; }
+
+/* ===== Workout metrics ===== */
+/* The session dialog's metrics section and the Metrics › Workouts table. */
+.session-metrics { display: grid; gap: var(--gap); }
+.session-metrics-head h3 { margin: 0; }
+.session-metrics-head .note { margin-top: 3px; }
+.session-metrics-body { display: grid; gap: var(--stack); }
+/* The dialog is narrower than a panel, so the mini metrics take a smaller track
+   than `.trend-stats` does on a full-width view. A label that wraps must not
+   push its value out of line with the rest of the row. */
+.metric-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 116px), 1fr)); gap: 8px; }
+.metric-row .mini-metric { display: flex; flex-direction: column; }
+.metric-row .mini-metric strong { margin-top: auto; padding-top: 4px; }
+.exercise-hr .note { margin: 0; }
+.exercise-hr-number { color: var(--text-3); width: 1.5em; }
+/* A dialog reports its own outcome inline, under the action that caused it. */
+.fetch-action { display: grid; justify-items: center; gap: 8px; }
+/* The empty state gives its paragraphs a top margin; here the grid gap is enough. */
+.fetch-action p { margin: 0; }
+.zone-block, .exercise-hr { display: grid; gap: 9px; }
+/* The session name is a control, so it keeps the column's left alignment; the
+   table keeps its full width and scrolls inside `.metrics-table` when narrow —
+   which only works if the panel is allowed to be narrower than its content. */
+.metrics-workouts-view .panel { min-width: 0; }
+.workout-metrics-table { min-width: 520px; }
+.workout-metrics-table th:nth-child(2), .workout-metrics-table td:nth-child(2) { text-align: left; }
+.workout-metrics-table td:first-child { white-space: nowrap; }
+.workout-metrics-name .text-button { text-align: left; }
 
 /* ===== Settings ===== */
 /* Every settings panel is a plain stack; the panel header's own margin would

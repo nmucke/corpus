@@ -82,6 +82,28 @@ export function formatDateTime(value) {
   return dateLabel(value, { dateStyle: 'medium', timeStyle: 'short' });
 }
 
+/**
+ * A stopwatch reading for elapsed time inside a session: `12:30`, `1:02:30`.
+ * Sub-minute resolution matters here, so this is not `formatDuration`.
+ */
+export function formatElapsed(ms) {
+  const number = finite(ms);
+  if (number == null) return MISSING;
+  const total = Math.round(Math.abs(number) / 1000);
+  const sign = number < 0 ? '-' : '';
+  const hours = Math.floor(total / 3600);
+  const minutes = Math.floor((total % 3600) / 60);
+  const seconds = total % 60;
+  const pad = (value) => String(value).padStart(2, '0');
+  return hours ? `${sign}${hours}:${pad(minutes)}:${pad(seconds)}` : `${sign}${minutes}:${pad(seconds)}`;
+}
+
+/** A heart rate with its unit, for the trace readout (cells keep the unit in the header). */
+export function formatBpm(value) {
+  const number = finite(value);
+  return number == null ? MISSING : `${formatNumber(number)} bpm`;
+}
+
 /** Kilograms in the display unit (no unit suffix — units belong in labels). */
 export function convertKg(kg, unit = 'kg') {
   const number = finite(kg);

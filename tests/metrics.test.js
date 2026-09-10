@@ -90,11 +90,11 @@ async function connect(service) {
   return service.googleHealthCallback({ code: 'auth-code-value', state });
 }
 
-test('schema version 6 creates the metric tables and demo metrics never touch them', async (t) => {
+test('schema version 6 metric tables stay in place and demo metrics never touch them', async (t) => {
   const { service, dataDir } = await withService(t, async () => { throw new Error('not called'); });
   const db = new DatabaseSync(path.join(dataDir, 'corpus.sqlite'), { readOnly: true });
   t.after(() => db.close());
-  assert.equal(db.prepare('SELECT value FROM meta WHERE key = ?').get('schema_version').value, '6');
+  assert.equal(db.prepare('SELECT value FROM meta WHERE key = ?').get('schema_version').value, '7');
   const names = db.prepare("SELECT name FROM sqlite_master WHERE name IN ('metric_sources', 'metric_points', 'metric_points_by_metric_date') ORDER BY name").all().map((row) => row.name);
   assert.deepEqual(names, ['metric_points', 'metric_points_by_metric_date', 'metric_sources']);
   const metrics = service.getMetrics({ days: 90 });
@@ -312,4 +312,312 @@ test('a sync with a failed data type keeps its cursor so the same range is fetch
   assert.equal(second.sources[0].syncedThrough, today);
   const rollup = mock.calls.slice(before).find((call) => call.path.endsWith('/steps/dataPoints:dailyRollUp'));
   assert.deepEqual(JSON.parse(rollup.body).range.start, { date: parts(addDays(today, -365)) }, 'the retry fetches the full first-sync range');
+});
+
+// --- workout metrics ---------------------------------------------------------
+
+const WORKOUT_START = `${yesterday}T17:00:00+00:00`; // Hevy's offset form
+const WORKOUT_END = `${yesterday}T18:00:00+00:00`;
+const hevyWorkout = (id, start = WORKOUT_START, end = WORKOUT_END) => ({
+  id,
+  title: 'Full Body',
+  routine_id: 'routine-1',
+  start_time: start,
+  end_time: end,
+  exercises: [
+    { index: 0, title: 'Squat', exercise_template_id: 'template-1', sets: [{ index: 0, type: 'warmup', weight_kg: 40, reps: 10 }, { index: 1, type: 'normal', weight_kg: 100, reps: 5 }] },
+    { index: 1, title: 'Row', exercise_template_id: 'template-1', sets: [{ index: 0, type: 'normal', weight_kg: 60, reps: 10 }] },
+  ],
+});
+const hevyRoutine = { id: 'routine-1', title: 'Full Body', folder_id: null, exercises: [{ index: 0, title: 'Squat', exercise_template_id: 'template-1', rest_seconds: 180, sets: [{ index: 0, type: 'normal', rep_range: { start: 5, end: 8 } }] }, { index: 1, title: 'Row', exercise_template_id: 'template-1', rest_seconds: 60, sets: [{ index: 0, type: 'normal', rep_range: { start: 8, end: 12 } }] }] };
+const hevyTemplate = { id: 'template-1', title: 'Squat', primary_muscle_group: 'quadriceps', type: 'weight_reps' };
+
+// Google answers a workout window with one sample every 30 s from two sources
+// plus minute intervals, so dedupe, clipping, and the ledger are all exercised.
+function windowRange(parsed, body) {
+  if (body) { const value = JSON.parse(body); return [Date.parse(value.range.startTime), Date.parse(value.range.endTime)]; }
+  const times = [...parsed.searchParams.get('filter').matchAll(/"([^"]+)"/g)].map((match) => Date.parse(match[1]));
+  return times;
+}
+const watchPoint = (at) => ({ name: `users/me/dataTypes/heart-rate/dataPoints/hr-${at}`, dataSource: { platform: 'FITBIT', device: { displayName: 'Pixel Watch 4' } }, heartRate: { sampleTime: { physicalTime: new Date(at).toISOString(), utcOffset: '0s' }, beatsPerMinute: '120' } });
+const appPoint = (at) => ({ name: `users/me/dataTypes/heart-rate/dataPoints/app-${at}`, dataSource: { platform: 'HEALTH_CONNECT', application: { packageName: 'com.hevy' } }, heartRate: { sampleTime: { physicalTime: new Date(at + 5000).toISOString(), utcOffset: '0s' }, beatsPerMinute: '99' } });
+// `primary` chooses which heart-rate recorder dominates the window: both send a
+// sample every 30 s ("watch" wins that tie on the FITBIT platform), or the app
+// sends every 30 s against one watch sample a minute.
+function workoutPoints(slug, parsed, body, primary = 'watch') {
+  const [from, to] = windowRange(parsed, body);
+  const points = [];
+  for (let at = from; at < to; at += 30_000) {
+    if (slug === 'heart-rate') {
+      if (primary === 'watch' || at % 60_000 === 0) points.push(watchPoint(at));
+      points.push(appPoint(at));
+    }
+  }
+  if (slug === 'active-zone-minutes') {
+    for (let at = from; at < to; at += 60_000) points.push({ activeZoneMinutes: { interval: { startTime: new Date(at).toISOString(), endTime: new Date(at + 60_000).toISOString() }, heartRateZone: 'FAT_BURN', activeZoneMinutes: '1' } });
+  }
+  if (slug === 'steps' || slug === 'total-calories') {
+    for (let at = from; at < to; at += 60_000) {
+      const payload = slug === 'steps' ? { steps: { countSum: '30' } } : { totalCalories: { kcalSum: 8 } };
+      points.push({ startTime: new Date(at).toISOString(), endTime: new Date(at + 60_000).toISOString(), ...payload });
+    }
+  }
+  return points;
+}
+
+// Answers Hevy and Google from one fake fetch. `hevy.workouts` is the current
+// snapshot; `fail` marks a workout data type slug that should return 500.
+function combinedFetch({ workouts = [hevyWorkout('w1')], fail = null, primary = 'watch' } = {}) {
+  const google = googleFetch({ tokens: { authorization_code: () => tokenAnswer('access-1') } });
+  const state = { workouts, fail, primary };
+  const calls = [];
+  const fetchImpl = async (url, options = {}) => {
+    const parsed = new URL(String(url));
+    if (parsed.hostname === 'api.hevyapp.com') {
+      const resource = parsed.pathname.split('/').at(-1);
+      const items = { workouts: state.workouts, routines: [hevyRoutine], exercise_templates: [hevyTemplate] }[resource] ?? [];
+      return jsonResponse({ page: Number(parsed.searchParams.get('page')), page_count: 1, [resource]: Number(parsed.searchParams.get('page')) === 1 ? items : [] });
+    }
+    if (parsed.hostname === 'health.googleapis.com' && /heart-rate|active-zone-minutes|:rollUp/.test(parsed.pathname)) {
+      const slug = parsed.pathname.split('/dataTypes/')[1].split('/')[0];
+      calls.push({ slug, path: parsed.pathname });
+      if (state.fail === slug) return jsonResponse({ error: { message: 'boom' } }, 500);
+      const points = workoutPoints(slug, parsed, options.body, state.primary);
+      return jsonResponse(parsed.pathname.endsWith(':rollUp') ? { rollupDataPoints: points } : { dataPoints: points });
+    }
+    return google.fetchImpl(url, options);
+  };
+  return { fetchImpl, calls, state, googleCalls: google.calls };
+}
+
+async function liveService(t, mock) {
+  const { service, dataDir } = await withService(t, mock.fetchImpl);
+  await service.saveSettings({ apiKey: 'a-safe-test-key' });
+  await connect(service);
+  await service.sync();
+  return { service, dataDir };
+}
+
+test('schema version 7 adds the workout sample tables and demo workout metrics never write', async (t) => {
+  const { service, dataDir } = await withService(t, async () => { throw new Error('not called'); });
+  const db = new DatabaseSync(path.join(dataDir, 'corpus.sqlite'), { readOnly: true });
+  t.after(() => db.close());
+  assert.equal(db.prepare('SELECT value FROM meta WHERE key = ?').get('schema_version').value, '7');
+  const names = db.prepare("SELECT name FROM sqlite_master WHERE name IN ('workout_samples', 'workout_sample_windows') ORDER BY name").all().map((row) => row.name);
+  assert.deepEqual(names, ['workout_sample_windows', 'workout_samples']);
+
+  const demo = service.getWorkoutMetrics('demo-workout-01');
+  assert.equal(demo.mode, 'demo');
+  assert.equal(demo.status, 'ready');
+  assert.equal(demo.workout.id, 'demo-workout-01');
+  assert.ok(demo.series.heart_rate.samples.length > 100);
+  assert.ok(demo.summary.heart_rate.avg > 80 && demo.summary.heart_rate.avg < 190);
+  assert.equal(demo.estimated_segments, true);
+  assert.ok(demo.exercises.length >= 1);
+  assert.deepEqual(service.getWorkoutMetrics('demo-workout-01'), demo, 'demo workout metrics are deterministic');
+  assert.equal(service.getWorkoutMetrics('demo-workout-07').status, 'empty', 'the front end must handle an empty window');
+  assert.deepEqual(service.getWorkoutMetrics('demo-workout-07').series.heart_rate.samples, []);
+  assert.ok(service.getWorkoutMetrics('demo-workout-07').fetched_at, 'an empty window was still fetched');
+  // Demo mode also has to reach the "Fetch from Google Health" state.
+  const pending = service.getWorkoutMetrics('demo-workout-03');
+  assert.equal(pending.status, 'unfetched');
+  assert.equal(pending.fetched_at, null);
+  assert.equal(pending.source, null);
+  assert.deepEqual(pending.series.heart_rate.samples, []);
+  assert.equal(pending.summary.heart_rate, null);
+  assert.ok(pending.window.start_ms < Date.parse(pending.workout.start_time), 'the padded window is still offered');
+  await assert.rejects(async () => service.getWorkoutMetrics('nope'), (error) => error.code === 'workout_not_found' && error.status === 404);
+
+  const overview = service.getWorkoutMetricsOverview({ days: 90 });
+  assert.equal(overview.mode, 'demo');
+  assert.deepEqual(overview.range, { from: addDays(today, -89), to: today });
+  assert.equal(overview.coverage.workouts, overview.workouts.length);
+  assert.ok(overview.coverage.with_metrics > 0 && overview.coverage.empty > 0 && overview.coverage.unfetched > 0, 'every coverage state is visible in demo mode');
+  assert.equal(overview.workouts.find((row) => row.id === 'demo-workout-03')?.status, 'unfetched');
+  // A demo sync stays a no-op, so the unfetched window stays unfetched.
+  await service.syncWorkoutMetrics({ workoutIds: ['demo-workout-03'], budget: 1 });
+  assert.equal(service.getWorkoutMetrics('demo-workout-03').status, 'unfetched');
+  assert.ok(overview.workouts[0].start_time >= overview.workouts.at(-1).start_time, 'newest first');
+  assert.equal(rowCount(dataDir, 'SELECT COUNT(*) AS count FROM workout_samples').count, 0);
+  assert.equal(rowCount(dataDir, 'SELECT COUNT(*) AS count FROM workout_sample_windows').count, 0);
+  // Demo mode cannot reach Google, and asking for a sync writes nothing.
+  const result = await service.syncWorkoutMetrics();
+  assert.deepEqual(result, { fetched: 0, empty: 0, failed: [], warnings: ['Demo mode does not fetch workout metrics from Google Health.'] });
+  assert.equal(rowCount(dataDir, 'SELECT COUNT(*) AS count FROM workout_samples').count, 0);
+});
+
+test('workout metric sync stores one window per workout and re-syncs do nothing', async (t) => {
+  const mock = combinedFetch({ workouts: [hevyWorkout('w1'), hevyWorkout('w2', `${yesterday}T19:00:00+00:00`, `${yesterday}T20:00:00+00:00`)] });
+  const { service, dataDir } = await liveService(t, mock);
+  const result = await service.syncWorkoutMetrics();
+  assert.deepEqual({ ...result, warnings: result.warnings.filter((warning) => !/ignored/.test(warning)) }, { fetched: 2, empty: 0, failed: [], warnings: [] });
+  assert.equal(rowCount(dataDir, 'SELECT COUNT(*) AS count FROM workout_sample_windows').count, 2);
+  assert.ok(rowCount(dataDir, 'SELECT COUNT(*) AS count FROM workout_samples').count > 100);
+  const ledger = rowCount(dataDir, "SELECT * FROM workout_sample_windows WHERE workout_id = 'w1'");
+  assert.equal(ledger.status, 'complete');
+  assert.equal(ledger.start_ms, Date.parse(WORKOUT_START) - 300_000);
+  assert.equal(ledger.end_ms, Date.parse(WORKOUT_END) + 600_000);
+  const detail = JSON.parse(ledger.detail_json);
+  assert.equal(detail.sourceKey, 'FITBIT/Pixel Watch 4');
+  assert.ok(detail.sampleCounts.heart_rate > 100);
+  assert.doesNotMatch(ledger.detail_json, /access-1|refresh-1/);
+
+  const metrics = service.getWorkoutMetrics('w1');
+  assert.equal(metrics.mode, 'live');
+  assert.equal(metrics.status, 'ready');
+  assert.equal(metrics.source, 'Pixel Watch 4');
+  assert.ok(metrics.fetched_at);
+  assert.deepEqual(metrics.window, { start_ms: ledger.start_ms, end_ms: ledger.end_ms });
+  assert.equal(metrics.summary.heart_rate.avg, 120, 'the second overlapping source is dropped');
+  assert.equal(metrics.summary.heart_rate.min, 120);
+  assert.equal(metrics.summary.steps, 30 * 60, 'one 30-step bucket per workout minute');
+  assert.deepEqual(metrics.summary.zones, { FAT_BURN: 60, CARDIO: 0, PEAK: 0, none: 0 });
+  assert.equal(metrics.summary.duration_min, 60);
+  assert.equal(metrics.exercises.length, 2);
+  // The routine's rest values weight the estimated segments: 2 x 220 against 1 x 100.
+  assert.equal(metrics.exercises[0].to_ms - metrics.exercises[0].from_ms, Math.round((60 * 60_000 * 440) / 540));
+  assert.ok(metrics.exercises[0].heart_rate.avg > 0);
+  assert.equal(metrics.estimated_segments, true);
+
+  const overview = service.getWorkoutMetricsOverview({ days: 7 });
+  assert.equal(overview.mode, 'live');
+  assert.deepEqual(overview.coverage, { workouts: 2, with_metrics: 2, unfetched: 0, empty: 0 });
+  assert.equal(overview.workouts[0].id, 'w2', 'newest first');
+  assert.equal(overview.workouts[0].set_count, 2);
+  assert.equal(overview.workouts[0].volume_kg, 1100);
+  assert.equal(overview.workouts[0].heart_rate.avg, 120);
+  assert.equal(overview.workouts[0].zones.FAT_BURN, 60);
+
+  const before = mock.calls.length;
+  const samplesBefore = rowCount(dataDir, 'SELECT COUNT(*) AS count FROM workout_samples').count;
+  assert.deepEqual(await service.syncWorkoutMetrics(), { fetched: 0, empty: 0, failed: [], warnings: [] });
+  assert.equal(mock.calls.length, before, 'a complete window is never re-fetched');
+  assert.equal(rowCount(dataDir, 'SELECT COUNT(*) AS count FROM workout_samples').count, samplesBefore, 're-sync is idempotent');
+
+  // Hevy edited the workout times: the window moved, so it is fetched again.
+  mock.state.workouts = [hevyWorkout('w1', WORKOUT_START, `${yesterday}T18:30:00+00:00`), hevyWorkout('w2', `${yesterday}T19:00:00+00:00`, `${yesterday}T20:00:00+00:00`)];
+  await service.sync();
+  const moved = await service.syncWorkoutMetrics();
+  assert.equal(moved.fetched, 1);
+  assert.equal(rowCount(dataDir, "SELECT end_ms FROM workout_sample_windows WHERE workout_id = 'w1'").end_ms, Date.parse(`${yesterday}T18:30:00Z`) + 600_000);
+  assert.equal(service.getWorkoutMetrics('w1').summary.duration_min, 90);
+
+  // Samples are time-addressed and outlive Hevy reconciliation.
+  mock.state.workouts = [hevyWorkout('w2', `${yesterday}T19:00:00+00:00`, `${yesterday}T20:00:00+00:00`)];
+  await service.sync();
+  assert.equal(service.getState().workouts.length, 1);
+  assert.ok(rowCount(dataDir, 'SELECT COUNT(*) AS count FROM workout_samples').count > 100, 'dropping a workout keeps its samples');
+  assert.equal(rowCount(dataDir, "SELECT COUNT(*) AS count FROM workout_sample_windows WHERE workout_id = 'w1'").count, 1);
+  await assert.rejects(async () => service.getWorkoutMetrics('w1'), { code: 'workout_not_found' });
+});
+
+test('re-fetching a window replaces its samples instead of interleaving two sources', async (t) => {
+  const mock = combinedFetch({ workouts: [hevyWorkout('w1')] });
+  const { service, dataDir } = await liveService(t, mock);
+  await service.syncWorkoutMetrics();
+  assert.equal(service.getWorkoutMetrics('w1').summary.heart_rate.avg, 120, 'the watch is the primary source');
+
+  // The phone app now records twice as often, so it becomes the primary source.
+  // Keeping the watch's old samples alongside it would invent a sawtooth.
+  mock.state.primary = 'app';
+  mock.state.workouts = [hevyWorkout('w1', WORKOUT_START, `${yesterday}T18:30:00+00:00`)];
+  await service.sync();
+  assert.equal((await service.syncWorkoutMetrics()).fetched, 1);
+  const metrics = service.getWorkoutMetrics('w1');
+  assert.equal(metrics.source, 'com.hevy');
+  assert.equal(metrics.summary.heart_rate.avg, 99);
+  assert.equal(metrics.summary.heart_rate.max, 99, 'no sample from the previous primary source survived');
+  const values = new Set(metrics.series.heart_rate.samples.map(([, value]) => value));
+  assert.deepEqual([...values], [99]);
+  assert.equal(rowCount(dataDir, "SELECT COUNT(*) AS count FROM workout_samples WHERE metric = 'heart_rate' AND value = 120").count, 0);
+});
+
+test('repeated per-window warnings are reported once', async (t) => {
+  const workouts = Array.from({ length: 3 }, (_, index) => hevyWorkout(`w${index}`, `${yesterday}T0${index + 1}:00:00+00:00`, `${yesterday}T0${index + 1}:30:00+00:00`));
+  const mock = combinedFetch({ workouts, fail: 'steps' });
+  const { service } = await liveService(t, mock);
+  const result = await service.syncWorkoutMetrics();
+  // Selection is newest first; the merged groups are then fetched in time order.
+  assert.deepEqual([...result.failed].sort(), ['w0', 'w1', 'w2'], 'every window is left for the next sync');
+  assert.deepEqual(result.warnings, [...new Set(result.warnings)], 'three windows produce one warning each, not nine');
+  assert.ok(result.warnings.includes('steps: request failed (500)'));
+});
+
+test('a failed workout window leaves no ledger row and is retried', async (t) => {
+  const mock = combinedFetch({ workouts: [hevyWorkout('w1')], fail: 'steps' });
+  const { service, dataDir } = await liveService(t, mock);
+  const failedRun = await service.syncWorkoutMetrics();
+  assert.deepEqual(failedRun.failed, ['w1']);
+  assert.equal(failedRun.fetched, 0);
+  assert.ok(failedRun.warnings.some((warning) => warning.startsWith('steps:')));
+  assert.equal(rowCount(dataDir, 'SELECT COUNT(*) AS count FROM workout_sample_windows').count, 0);
+  assert.equal(rowCount(dataDir, 'SELECT COUNT(*) AS count FROM workout_samples').count, 0);
+  const unfetched = service.getWorkoutMetrics('w1');
+  assert.equal(unfetched.status, 'unfetched');
+  assert.deepEqual(unfetched.series.steps.samples, []);
+  assert.equal(unfetched.summary.heart_rate, null);
+  assert.equal(unfetched.fetched_at, null);
+  assert.ok(unfetched.window.start_ms < Date.parse(WORKOUT_START));
+
+  mock.state.fail = null;
+  assert.equal((await service.syncWorkoutMetrics()).fetched, 1, 'the window is retried on the next sync');
+  assert.equal(service.getWorkoutMetrics('w1').status, 'ready');
+});
+
+test('a window Google has no data for is recorded as empty and stays retryable', async (t) => {
+  const mock = combinedFetch({ workouts: [hevyWorkout('w1')] });
+  const empty = { ...mock, fetchImpl: async (url, options) => (String(url).includes('health.googleapis.com') && /heart-rate|active-zone-minutes|:rollUp/.test(String(url)) ? jsonResponse({ dataPoints: [], rollupDataPoints: [] }) : mock.fetchImpl(url, options)) };
+  const { service, dataDir } = await liveService(t, empty);
+  assert.deepEqual(await service.syncWorkoutMetrics(), { fetched: 0, empty: 1, failed: [], warnings: [] });
+  assert.equal(rowCount(dataDir, "SELECT status FROM workout_sample_windows WHERE workout_id = 'w1'").status, 'empty');
+  const metrics = service.getWorkoutMetrics('w1');
+  assert.equal(metrics.status, 'empty');
+  assert.ok(metrics.fetched_at);
+  assert.equal(metrics.source, null);
+  assert.deepEqual(metrics.series.heart_rate.samples, []);
+  assert.equal((await service.syncWorkoutMetrics()).empty, 1, 'an empty window is retried while data can still arrive');
+});
+
+test('the daily sync covers workout windows too and merges the source cursor', async (t) => {
+  const mock = combinedFetch({ workouts: [hevyWorkout('w1')] });
+  const { service, dataDir } = await liveService(t, mock);
+  const db = new DatabaseSync(path.join(dataDir, 'corpus.sqlite'));
+  db.prepare('UPDATE metric_sources SET cursor_json = ? WHERE id = ?').run(JSON.stringify({ note: 'keep me' }), 'google-health');
+  db.close();
+  const synced = await service.syncMetrics();
+  assert.ok(synced.imported > 0);
+  assert.equal(synced.sources[0].syncedThrough, today);
+  assert.deepEqual(JSON.parse(rowCount(dataDir, "SELECT cursor_json FROM metric_sources WHERE id = 'google-health'").cursor_json), { note: 'keep me', syncedThrough: today }, 'the cursor write merges instead of replacing');
+  assert.equal(rowCount(dataDir, 'SELECT COUNT(*) AS count FROM workout_sample_windows').count, 1, 'Sync Google Health covers workout windows');
+  assert.equal(service.getWorkoutMetrics('w1').status, 'ready');
+
+  // A workout window failure is a warning on the daily sync, never an error.
+  mock.state.workouts = [hevyWorkout('w1'), hevyWorkout('w3', `${yesterday}T21:00:00+00:00`, `${yesterday}T22:00:00+00:00`)];
+  await service.sync();
+  mock.state.fail = 'heart-rate';
+  const again = await service.syncMetrics();
+  assert.ok(again.imported > 0);
+  assert.ok(again.warnings.some((warning) => warning.startsWith('heart-rate:')));
+  assert.equal(rowCount(dataDir, 'SELECT COUNT(*) AS count FROM workout_sample_windows').count, 1);
+});
+
+test('workout windows need a Google connection and respect the budget', async (t) => {
+  const starts = Array.from({ length: 4 }, (_, index) => hevyWorkout(`w${index}`, `${yesterday}T0${index + 1}:00:00+00:00`, `${yesterday}T0${index + 1}:30:00+00:00`));
+  const mock = combinedFetch({ workouts: starts });
+  const { service, dataDir } = await withService(t, mock.fetchImpl);
+  await service.saveSettings({ apiKey: 'a-safe-test-key' });
+  await service.sync();
+  assert.equal(service.getWorkoutMetrics('w0').status, 'not_connected', 'live mode without Google points at Settings');
+  assert.equal(service.getWorkoutMetricsOverview({ days: 7 }).coverage.unfetched, 4);
+  await assert.rejects(service.syncWorkoutMetrics(), (error) => error.code === 'not_connected' || error.code === 'no_google_client');
+  await connect(service);
+  assert.equal(service.getWorkoutMetrics('w0').status, 'unfetched');
+  const limited = await service.syncWorkoutMetrics({ budget: 2 });
+  assert.equal(limited.fetched, 2);
+  assert.equal(rowCount(dataDir, 'SELECT COUNT(*) AS count FROM workout_sample_windows').count, 2);
+  assert.equal(rowCount(dataDir, "SELECT COUNT(*) AS count FROM workout_sample_windows WHERE workout_id IN ('w3', 'w2')").count, 2, 'newest workouts first');
+  assert.equal((await service.syncWorkoutMetrics({ workoutIds: ['w0'], budget: 1 })).fetched, 1);
+  assert.equal(service.getWorkoutMetrics('w0').status, 'ready');
+  assert.equal(service.getWorkoutMetrics('w1').status, 'unfetched');
+  await assert.rejects(service.syncWorkoutMetrics({ workoutIds: [''] }), { code: 'validation' });
 });

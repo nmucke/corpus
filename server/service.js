@@ -7,16 +7,21 @@ import { fetchSnapshot, postRoutine, updateRoutine as putRoutine, ROUTINE_UNCERT
 import { programTimeline, validateProgramSchedule } from '../public/program-timeline.js';
 import { METRICS, METRIC_KEYS, isMetricKey } from '../public/metrics-catalog.js';
 import { entityHash, proposalDraft, publicProposal } from './proposals.js';
-import { demoMetricSeries } from './metrics-demo.js';
-import { SCOPES, GoogleHealthError, pkcePair, authorizationUrl, exchangeCode, refreshAccessToken, revokeToken, fetchMetricPoints } from './google-health.js';
+import { demoMetricSeries, demoWorkoutMetrics, demoWorkoutMetricsOverview } from './metrics-demo.js';
+import { SCOPES, GoogleHealthError, pkcePair, authorizationUrl, exchangeCode, refreshAccessToken, revokeToken, fetchMetricPoints, fetchWorkoutSamples } from './google-health.js';
+import { isWorkoutMetricKey } from '../public/workout-metrics-catalog.js';
+import { workoutWindow, mergeWindows, needsFetch, summariseWorkout, overviewRow, coverageCounts, blankMetrics, parseTimeMs } from './workout-metrics.js';
 
 export { entityHash } from './proposals.js';
 
-const SCHEMA_VERSION = 6;
+const SCHEMA_VERSION = 7;
 const GOOGLE_SOURCE = 'google-health';
 const OAUTH_PENDING_MS = 10 * 60 * 1000;
 const METRICS_FIRST_SYNC_DAYS = 365;
 const METRICS_RESYNC_DAYS = 7;
+// Windows fetched per sync call, newest workouts first. Roughly four requests
+// each, so a full sync stays well inside Google's per-minute budget.
+const WORKOUT_WINDOW_BUDGET = 25;
 const PROGRAM_TITLE_MAX = 160;
 const PROGRAM_DESCRIPTION_MAX = 4000;
 
@@ -93,7 +98,9 @@ function initialise(db) {
     CREATE TABLE IF NOT EXISTS training_profiles (mode TEXT PRIMARY KEY, goals TEXT NOT NULL, equipment TEXT NOT NULL, constraints TEXT NOT NULL, schedule TEXT NOT NULL, updated_at TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS metric_sources (id TEXT PRIMARY KEY, kind TEXT NOT NULL, label TEXT NOT NULL, cursor_json TEXT, last_sync TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS metric_points (source TEXT NOT NULL REFERENCES metric_sources(id) ON DELETE CASCADE, metric TEXT NOT NULL, source_id TEXT NOT NULL, date TEXT NOT NULL, start_time TEXT, end_time TEXT, value REAL NOT NULL, raw_json TEXT, imported_at TEXT NOT NULL, PRIMARY KEY(source, metric, source_id));
-    CREATE INDEX IF NOT EXISTS metric_points_by_metric_date ON metric_points(metric, date);`);
+    CREATE INDEX IF NOT EXISTS metric_points_by_metric_date ON metric_points(metric, date);
+    CREATE TABLE IF NOT EXISTS workout_samples (source TEXT NOT NULL REFERENCES metric_sources(id) ON DELETE CASCADE, metric TEXT NOT NULL, at_ms INTEGER NOT NULL, value REAL NOT NULL, duration_ms INTEGER, label TEXT, PRIMARY KEY (source, metric, at_ms)) WITHOUT ROWID;
+    CREATE TABLE IF NOT EXISTS workout_sample_windows (source TEXT NOT NULL REFERENCES metric_sources(id) ON DELETE CASCADE, workout_id TEXT NOT NULL, start_ms INTEGER NOT NULL, end_ms INTEGER NOT NULL, status TEXT NOT NULL, detail_json TEXT, fetched_at TEXT NOT NULL, PRIMARY KEY (source, workout_id)) WITHOUT ROWID;`);
   const programColumns = new Set(db.prepare('PRAGMA table_info(programs)').all().map((column) => column.name));
   const mappingColumns = new Set(db.prepare('PRAGMA table_info(local_routine_mappings)').all().map((column) => column.name));
   const needsMigration = !version || Number(version) < SCHEMA_VERSION || !programColumns.has('start_date') || !programColumns.has('duration_weeks') || !mappingColumns.has('result_json');
@@ -401,6 +408,7 @@ export async function createService({ dataDir, fetchImpl = globalThis.fetch } = 
   let privateSettings = await readPrivateSettings(settingsFile);
   let syncPromise = null;
   let metricsSyncPromise = null;
+  let workoutSyncPromise = null;
   let pendingOauth = null; // { state, verifier, redirectUri, expires } for the single in-flight Google sign-in
   let writeQueue = Promise.resolve();
   const serialiseWrite = (work) => {
@@ -426,6 +434,39 @@ export async function createService({ dataDir, fetchImpl = globalThis.fetch } = 
     ? new ServiceError(error.code, error.message, { unauthorized: 401, rate_limited: 429, network: 503 }[error.code] ?? 502)
     : error);
   const notConnected = () => new ServiceError('not_connected', 'Google Health needs to be reconnected.', 401);
+  // Shared Google token handling for every sync: refresh an access token that is
+  // about to expire, then run the request with one refresh-and-retry after a 401
+  // and a disconnect when the grant itself is gone (revoked, or the test-user
+  // consent expired). A transient token failure keeps the grant.
+  const googleSession = async () => {
+    const client = googleClient();
+    if (!client) throw new ServiceError('no_google_client', 'Add a Google OAuth client ID and secret in Settings before syncing.');
+    let tokens = googleTokens();
+    if (!tokens) throw notConnected();
+    const disconnect = async () => { await saveGoogleTokens(null); return notConnected(); };
+    const refresh = async (afterUnauthorized = false) => {
+      let fresh;
+      try { fresh = await refreshAccessToken(fetchImpl, { ...client, refreshToken: tokens.refreshToken }); } catch (error) {
+        if (error instanceof GoogleHealthError && (error.code === 'unauthorized' || (error.code === 'oauth' && (afterUnauthorized || /invalid_grant/.test(error.message))))) throw await disconnect();
+        throw googleError(error);
+      }
+      if (!fresh?.accessToken) throw await disconnect();
+      tokens = { ...tokens, accessToken: fresh.accessToken, refreshToken: fresh.refreshToken || tokens.refreshToken, expiresAt: fresh.expiresAt ?? null, scope: fresh.scope ?? tokens.scope };
+      await saveGoogleTokens(tokens);
+    };
+    if (!tokens.expiresAt || Date.parse(tokens.expiresAt) - Date.now() < 60_000) await refresh();
+    const run = async (work) => {
+      try { return await work(tokens.accessToken); } catch (error) {
+        if (!(error instanceof GoogleHealthError) || error.code !== 'unauthorized') throw googleError(error);
+        await refresh(true);
+        try { return await work(tokens.accessToken); } catch (retryError) {
+          if (retryError instanceof GoogleHealthError && retryError.code === 'unauthorized') throw await disconnect();
+          throw googleError(retryError);
+        }
+      }
+    };
+    return { run };
+  };
   const metricSources = () => db.prepare('SELECT id, kind, label, cursor_json, last_sync FROM metric_sources ORDER BY created_at, id').all().map((row) => {
     let cursor = null;
     try { cursor = row.cursor_json ? parse(row.cursor_json) : null; } catch { /* treat an unreadable cursor as no cursor */ }
@@ -446,6 +487,153 @@ export async function createService({ dataDir, fetchImpl = globalThis.fetch } = 
     }
     return { mode: currentMode, range: { from, to }, sources: metricSources(), series };
   };
+  // --- workout metrics -------------------------------------------------------
+  const parseOrNull = (value) => { try { return value ? parse(value) : null; } catch { return null; } };
+  const workoutNotFound = () => new ServiceError('workout_not_found', 'Workout was not found.', 404);
+  const liveWorkouts = () => db.prepare('SELECT raw_json FROM workouts ORDER BY start_time DESC, id').all().map((row) => parse(row.raw_json));
+  // Window building needs only the times, so the sync pass never parses a
+  // workout payload it is not going to fetch.
+  const liveWorkoutTimes = () => db.prepare('SELECT id, start_time, end_time FROM workouts ORDER BY start_time DESC, id').all();
+  const liveWorkout = (id) => { const row = db.prepare('SELECT raw_json FROM workouts WHERE id = ?').get(id); return row ? parse(row.raw_json) : null; };
+  const templateTypes = (currentMode) => new Map((currentMode === 'demo' ? demoState().exerciseTemplates : db.prepare('SELECT raw_json FROM exercise_templates').all().map((row) => parse(row.raw_json))).map((template) => [String(template?.id), template?.type ?? '']));
+  // Routine rest values make the estimated exercise segments less wrong when the
+  // workout came from a routine; without one, segments are equal per set.
+  const restSecondsFor = (routineId) => {
+    if (!safeId(routineId)) return null;
+    const rows = db.prepare('SELECT exercise_index, rest_seconds FROM routine_exercises WHERE routine_id = ?').all(routineId);
+    return rows.length ? new Map(rows.map((row) => [row.exercise_index, row.rest_seconds])) : null;
+  };
+  const windowRow = (workoutId) => db.prepare('SELECT workout_id, start_ms, end_ms, status, detail_json, fetched_at FROM workout_sample_windows WHERE source = ? AND workout_id = ?').get(GOOGLE_SOURCE, workoutId) ?? null;
+  const storedSamples = (startMs, endMs) => db.prepare('SELECT metric, at_ms, value, duration_ms, label FROM workout_samples WHERE source = ? AND at_ms >= ? AND at_ms <= ? ORDER BY at_ms').all(GOOGLE_SOURCE, startMs, endMs)
+    .map((row) => ({ metric: row.metric, atMs: row.at_ms, value: row.value, durationMs: row.duration_ms, label: row.label }));
+  // The ledger row is the progress record: no row means the window was never
+  // fetched (or its fetch failed and will be retried).
+  const liveWorkoutMetrics = (workout, { detail = true } = {}) => {
+    const window = workoutWindow(workout);
+    const row = window ? windowRow(workout.id) : null;
+    const status = row ? (row.status === 'empty' ? 'empty' : 'ready') : (googleTokens() ? 'unfetched' : 'not_connected');
+    const stored = parseOrNull(row?.detail_json);
+    const body = status === 'ready' && window
+      ? summariseWorkout({ workout, samples: storedSamples(window.windowStartMs, window.windowEndMs), restSeconds: detail ? restSecondsFor(workout.routine_id) : null, detail })
+      : blankMetrics(workout);
+    return { status, fetchedAt: row?.fetched_at ?? null, source: typeof stored?.sourceLabel === 'string' ? stored.sourceLabel : null, body };
+  };
+  const workoutMetrics = (workoutId) => {
+    if (!safeId(workoutId)) throw new ServiceError('validation', 'Workout id is invalid.');
+    if (mode() === 'demo') {
+      const demo = demoState().workouts.find((workout) => workout.id === workoutId);
+      if (!demo) throw workoutNotFound();
+      return demoWorkoutMetrics(demo);
+    }
+    const workout = liveWorkout(workoutId);
+    if (!workout) throw workoutNotFound();
+    const { status, fetchedAt, source, body } = liveWorkoutMetrics(workout);
+    return {
+      mode: 'live',
+      workout: { id: workout.id, title: workout.title ?? null, start_time: workout.start_time ?? null, end_time: workout.end_time ?? null },
+      status,
+      fetched_at: fetchedAt,
+      window: body.window,
+      source,
+      series: body.series,
+      summary: body.summary,
+      exercises: body.exercises,
+      estimated_segments: true,
+    };
+  };
+  const workoutMetricsOverview = ({ days = 90 } = {}) => {
+    const count = clampDays(days);
+    const to = localDate(); const from = addDays(to, -(count - 1));
+    if (mode() === 'demo') return demoWorkoutMetricsOverview(demoState().workouts, { from, to });
+    const types = templateTypes('live');
+    const rows = [];
+    for (const workout of liveWorkouts()) {
+      const startMs = parseTimeMs(workout.start_time);
+      if (startMs === null) continue;
+      const date = localDate(new Date(startMs));
+      if (date < from || date > to) continue;
+      const { status, body } = liveWorkoutMetrics(workout, { detail: false });
+      rows.push(overviewRow({ workout, status, summary: status === 'ready' ? body.summary : null, templateTypes: types }));
+    }
+    return { mode: 'live', range: { from, to }, coverage: coverageCounts(rows), workouts: rows };
+  };
+  // Fetches the padded windows that need one, newest workouts first. Not wrapped
+  // in serialiseWrite: syncMetrics calls it from inside its own write turn.
+  const syncWorkoutWindows = async ({ workoutIds = null, budget = WORKOUT_WINDOW_BUDGET } = {}) => {
+    // Every window reports the same per-metric warnings, so they are collected
+    // once: 25 windows must not put the same sentence on screen 25 times.
+    const seenWarnings = new Set();
+    const result = { fetched: 0, empty: 0, failed: [], warnings: [] };
+    const warn = (warning) => { if (!seenWarnings.has(warning)) { seenWarnings.add(warning); result.warnings.push(warning); } };
+    if (mode() !== 'live') { warn('Demo mode does not fetch workout metrics from Google Health.'); return result; }
+    const ids = workoutIds == null ? null : new Set((Array.isArray(workoutIds) ? workoutIds : [workoutIds]).filter((value) => safeId(value)));
+    if (ids && !ids.size) throw new ServiceError('validation', 'Workout id is invalid.');
+    const limit = Math.min(100, Math.max(1, Math.trunc(Number(budget)) || WORKOUT_WINDOW_BUDGET));
+    const pending = [];
+    for (const workout of liveWorkoutTimes()) {
+      if (ids && !ids.has(workout.id)) continue;
+      const window = workoutWindow(workout);
+      if (!window || !needsFetch(window, windowRow(workout.id))) continue;
+      pending.push(window);
+      if (pending.length >= limit) break;
+    }
+    if (!pending.length) return result;
+    const google = await googleSession();
+    const insertSource = 'INSERT INTO metric_sources(id, kind, label, cursor_json, last_sync, created_at, updated_at) VALUES (?, ?, ?, NULL, NULL, ?, ?) ON CONFLICT(id) DO NOTHING';
+    const insertSample = 'INSERT INTO workout_samples(source, metric, at_ms, value, duration_ms, label) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(source, metric, at_ms) DO UPDATE SET value=excluded.value, duration_ms=excluded.duration_ms, label=excluded.label';
+    // A window that comes back with samples is rewritten, not merged into: a
+    // re-fetch that picks a different primary source must not leave the old
+    // source's samples interleaved with the new ones. Only this window's span is
+    // cleared, and the response replacing it covers all of it. An empty answer
+    // clears nothing, so a transient gap at Google cannot erase stored samples.
+    const clearSamples = 'DELETE FROM workout_samples WHERE source = ? AND at_ms >= ? AND at_ms <= ?';
+    const insertWindow = 'INSERT INTO workout_sample_windows(source, workout_id, start_ms, end_ms, status, detail_json, fetched_at) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(source, workout_id) DO UPDATE SET start_ms=excluded.start_ms, end_ms=excluded.end_ms, status=excluded.status, detail_json=excluded.detail_json, fetched_at=excluded.fetched_at';
+    for (const group of mergeWindows(pending)) {
+      let fetched;
+      try {
+        fetched = await google.run((accessToken) => fetchWorkoutSamples(fetchImpl, accessToken, { startMs: group.startMs, endMs: group.endMs }));
+      } catch (error) {
+        // Auth, rate limit, and network failures end the run; anything else
+        // leaves these windows without a row so the next sync retries them.
+        if (error instanceof ServiceError && ['not_connected', 'rate_limited', 'network'].includes(error.code)) throw error;
+        for (const window of group.windows) result.failed.push(window.workoutId);
+        warn(`workout window: ${error?.message ?? 'could not be fetched'}`);
+        continue;
+      }
+      const warnings = Array.isArray(fetched?.warnings) ? fetched.warnings.map(String) : [];
+      for (const warning of warnings) warn(warning);
+      if (Array.isArray(fetched?.failed) && fetched.failed.length) {
+        // A partial window would look complete forever; retry the whole thing.
+        for (const window of group.windows) result.failed.push(window.workoutId);
+        continue;
+      }
+      const samples = (Array.isArray(fetched?.samples) ? fetched.samples : [])
+        .filter((sample) => sample && isWorkoutMetricKey(sample.metric) && Number.isFinite(sample.atMs) && typeof sample.value === 'number' && Number.isFinite(sample.value));
+      const now = isoNow();
+      for (const window of group.windows) {
+        const inside = samples.filter((sample) => sample.atMs >= window.windowStartMs && sample.atMs <= window.windowEndMs);
+        const sampleCounts = {};
+        for (const sample of inside) sampleCounts[sample.metric] = (sampleCounts[sample.metric] ?? 0) + 1;
+        const status = inside.length ? 'complete' : 'empty';
+        const detail = { sampleCounts, sourceKey: fetched.sourceKey ?? null, sourceLabel: fetched.sourceLabel ?? null, warnings };
+        try {
+          db.exec('BEGIN IMMEDIATE');
+          db.prepare(insertSource).run(GOOGLE_SOURCE, 'api', 'Google Health', now, now);
+          if (inside.length) db.prepare(clearSamples).run(GOOGLE_SOURCE, window.windowStartMs, window.windowEndMs);
+          const insert = db.prepare(insertSample);
+          for (const sample of inside) insert.run(GOOGLE_SOURCE, sample.metric, Math.round(sample.atMs), sample.value, sample.durationMs == null ? null : Math.round(sample.durationMs), sample.label ?? null);
+          db.prepare(insertWindow).run(GOOGLE_SOURCE, window.workoutId, window.windowStartMs, window.windowEndMs, status, json(detail), now);
+          db.exec('COMMIT');
+        } catch (error) {
+          try { db.exec('ROLLBACK'); } catch { /* no transaction to roll back */ }
+          throw error;
+        }
+        if (status === 'empty') result.empty += 1; else result.fetched += 1;
+      }
+    }
+    return result;
+  };
+
   const programs = (currentMode) => db.prepare('SELECT id, title, description, days_json, start_date, duration_weeks, created_at, updated_at FROM programs WHERE mode = ? ORDER BY created_at').all(currentMode).map(({ days_json, ...program }) => ({ ...program, days: parse(days_json) }));
   const visibleRoutines = (currentMode) => {
     const base = currentMode === 'demo' ? demoState().routines : db.prepare('SELECT raw_json FROM routines ORDER BY title, id').all().map((row) => parse(row.raw_json));
@@ -493,6 +681,18 @@ export async function createService({ dataDir, fetchImpl = globalThis.fetch } = 
       return publicSettings();
     },
     getMetrics: metrics,
+    getWorkoutMetrics: workoutMetrics,
+    getWorkoutMetricsOverview: workoutMetricsOverview,
+    async syncWorkoutMetrics(options = {}) {
+      // One in-flight full sync at a time; a single-workout fetch still queues
+      // behind the other writes through serialiseWrite.
+      if (options?.workoutIds == null) {
+        if (workoutSyncPromise) return workoutSyncPromise;
+        workoutSyncPromise = serialiseWrite(() => syncWorkoutWindows(options));
+        try { return await workoutSyncPromise; } finally { workoutSyncPromise = null; }
+      }
+      return serialiseWrite(() => syncWorkoutWindows(options));
+    },
     async googleHealthConnect({ redirectUri } = {}) {
       const client = googleClient();
       if (!client) throw new ServiceError('no_google_client', 'Add a Google OAuth client ID and secret in Settings before connecting.');
@@ -532,36 +732,11 @@ export async function createService({ dataDir, fetchImpl = globalThis.fetch } = 
       if (metricsSyncPromise) return metricsSyncPromise;
       if (!googleTokens()) throw new ServiceError('not_connected', 'Connect Google Health in Settings before syncing.', 400);
       metricsSyncPromise = serialiseWrite(async () => {
-        const client = googleClient();
-        if (!client) throw new ServiceError('no_google_client', 'Add a Google OAuth client ID and secret in Settings before syncing.');
-        let tokens = googleTokens();
-        if (!tokens) throw notConnected();
-        const disconnect = async () => { await saveGoogleTokens(null); return notConnected(); };
-        // A refresh that Google rejects means the grant is gone (revoked, or the
-        // test-user consent expired); a transient token failure keeps the grant.
-        const refresh = async (afterUnauthorized = false) => {
-          let fresh;
-          try { fresh = await refreshAccessToken(fetchImpl, { ...client, refreshToken: tokens.refreshToken }); } catch (error) {
-            if (error instanceof GoogleHealthError && (error.code === 'unauthorized' || (error.code === 'oauth' && (afterUnauthorized || /invalid_grant/.test(error.message))))) throw await disconnect();
-            throw googleError(error);
-          }
-          if (!fresh?.accessToken) throw await disconnect();
-          tokens = { ...tokens, accessToken: fresh.accessToken, refreshToken: fresh.refreshToken || tokens.refreshToken, expiresAt: fresh.expiresAt ?? null, scope: fresh.scope ?? tokens.scope };
-          await saveGoogleTokens(tokens);
-        };
-        if (!tokens.expiresAt || Date.parse(tokens.expiresAt) - Date.now() < 60_000) await refresh();
+        const google = await googleSession();
         const to = localDate();
         const cursor = metricSources().find((source) => source.id === GOOGLE_SOURCE)?.syncedThrough;
         const from = cursor ? addDays(cursor < to ? cursor : to, -METRICS_RESYNC_DAYS) : addDays(to, -METRICS_FIRST_SYNC_DAYS);
-        let result;
-        try { result = await fetchMetricPoints(fetchImpl, tokens.accessToken, { from, to }); } catch (error) {
-          if (!(error instanceof GoogleHealthError) || error.code !== 'unauthorized') throw googleError(error);
-          await refresh(true);
-          try { result = await fetchMetricPoints(fetchImpl, tokens.accessToken, { from, to }); } catch (retryError) {
-            if (retryError instanceof GoogleHealthError && retryError.code === 'unauthorized') throw await disconnect();
-            throw googleError(retryError);
-          }
-        }
+        const result = await google.run((accessToken) => fetchMetricPoints(fetchImpl, accessToken, { from, to }));
         const points = (Array.isArray(result?.points) ? result.points : []).filter((point) => point && isMetricKey(point.metric) && safeId(point.sourceId) && isDateString(point.date) && typeof point.value === 'number' && Number.isFinite(point.value));
         const warnings = Array.isArray(result?.warnings) ? result.warnings.map(String) : [];
         const failed = Array.isArray(result?.failed) ? result.failed.map(String) : [];
@@ -574,14 +749,24 @@ export async function createService({ dataDir, fetchImpl = globalThis.fetch } = 
           // A sync in which any data type's request failed keeps its cursor, so
           // the next sync re-fetches the same range instead of leaving gaps behind.
           if (failed.length) db.prepare('UPDATE metric_sources SET last_sync = ?, updated_at = ? WHERE id = ?').run(now, now, GOOGLE_SOURCE);
-          else db.prepare('UPDATE metric_sources SET cursor_json = ?, last_sync = ?, updated_at = ? WHERE id = ?').run(json({ syncedThrough: to }), now, now, GOOGLE_SOURCE);
+          // Merge rather than replace: the cursor object may hold other keys.
+          else db.prepare('UPDATE metric_sources SET cursor_json = ?, last_sync = ?, updated_at = ? WHERE id = ?').run(json({ ...(parseOrNull(db.prepare('SELECT cursor_json FROM metric_sources WHERE id = ?').get(GOOGLE_SOURCE)?.cursor_json) ?? {}), syncedThrough: to }), now, now, GOOGLE_SOURCE);
           setMeta('mode', 'live');
           db.exec('COMMIT');
         } catch (error) {
           try { db.exec('ROLLBACK'); } catch { /* no transaction to roll back */ }
           throw error;
         }
-        return { ...metrics({ days: 90 }), imported: points.length, warnings };
+        // Workout windows are best effort: the daily series must not fail
+        // because Google had nothing for one workout.
+        let workoutWarnings = [];
+        try {
+          const workoutResult = await syncWorkoutWindows({ budget: WORKOUT_WINDOW_BUDGET });
+          workoutWarnings = workoutResult.warnings;
+        } catch (error) {
+          workoutWarnings = [`workout metrics: ${error?.message ?? 'could not fetch workout metrics'}`];
+        }
+        return { ...metrics({ days: 90 }), imported: points.length, warnings: [...warnings, ...workoutWarnings] };
       });
       try { return await metricsSyncPromise; } finally { metricsSyncPromise = null; }
     },

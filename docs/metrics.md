@@ -227,6 +227,254 @@ Design rules: reuse `.panel`, `.stat-grid`, `.stat-card`, `.period-picker`,
 change indicator, and the table. No new libraries. Charts stay SVG and CSS
 tokens only.
 
+## Workout metrics
+
+High-frequency data is fetched only **inside Hevy workout windows**, padded by
+five minutes before and ten minutes after (`WINDOW_PADDING` in
+`public/workout-metrics-catalog.js`) so the warm-up ramp and the recovery tail
+are visible in the chart. Inside a window Corpus stores the highest frequency
+Google offers (raw heart-rate samples, roughly every 1–3 s). There is no all-day
+intraday import.
+
+The shared catalog is `public/workout-metrics-catalog.js` — imported by the
+adapter, the summaries, and the browser. Adding a metric is one catalog row plus
+one payload mapper in `server/google-health.js`.
+
+| Metric key | Data type slug | Method | Payload | Stored |
+| --- | --- | --- | --- | --- |
+| `heart_rate` | `heart-rate` | `dataPoints` list | `heartRate.beatsPerMinute` (int64 string), `heartRate.sampleTime.physicalTime` | one sample per point (bpm) |
+| `steps` | `steps` | `dataPoints:rollUp` | `steps.countSum` | 60 s intervals (steps) |
+| `calories` | `total-calories` | `dataPoints:rollUp` | `totalCalories.kcalSum` | 60 s intervals (kcal) |
+| `zone` | `active-zone-minutes` | `dataPoints` list | `activeZoneMinutes.{interval,heartRateZone,activeZoneMinutes}` | one interval per zoned minute, `label` = `FAT_BURN`/`CARDIO`/`PEAK` |
+
+Verified against a live account on 2026-09-10; these corrections override the
+published docs:
+
+- `GET /v4/users/me/dataTypes/{slug}/dataPoints?filter=<field> >= "S" AND <field> < "E"&pageSize=5000`.
+  The default `pageSize` is **50** (which truncates a window) and the maximum is
+  **5000**; only `>=` and `<` comparators are accepted, and the filter field
+  prefixes are snake_case (`heart_rate.sample_time.physical_time`,
+  `active_zone_minutes.interval.start_time`). Timestamps are RFC 3339 at second
+  precision (start floored, end rounded up). `nextPageToken` is followed, capped
+  at 20 pages per metric.
+- `POST /v4/users/me/dataTypes/{slug}/dataPoints:rollUp` with body
+  `{ "range": { "startTime": RFC3339, "endTime": RFC3339 }, "windowSize": "60s" }`
+  → `{ "rollupDataPoints": [{ startTime, endTime, <payload> }] }`. Empty bins are
+  omitted and no `pageSize` is sent. This is a different action from the daily
+  `dataPoints:dailyRollUp`; `total-calories` and `calories-in-heart-rate-zone`
+  reject `list` with `400 UNSUPPORTED_DATA_TYPE_ACTION`.
+- A window can contain **two overlapping heart-rate sources** (a Pixel Watch via
+  `platform: "FITBIT"` and `com.hevy` via `HEALTH_CONNECT`). Interleaving them
+  would invent noise, so one primary source wins per window: most samples, then
+  a FITBIT platform, then a device over an application. The adapter returns
+  `sourceKey` (`FITBIT/Pixel Watch 4`) and `sourceLabel` (`Pixel Watch 4`), and
+  the dropped samples are reported as a warning. The same choice is made for
+  every listed data type (`heart_rate` and `zone`), because both carry a
+  `dataSource`; a roll-up is aggregated across sources by Google and has none.
+- Extension point, not used in v1: `exercise` list works **only without a
+  filter** (pageSize 25, newest first, `pageToken` is an offset). Hevy workouts
+  appear there as `STRENGTH_TRAINING` sessions from `com.hevy` with the Hevy
+  UUID in `notes`, which is the natural way to add session-level data later.
+
+Adapter entry point:
+
+```js
+export async function fetchWorkoutSamples(fetchImpl, accessToken, { startMs, endMs });
+// -> { samples: [{ metric, atMs, value, durationMs, label }], sourceKey, sourceLabel, warnings, failed }
+```
+
+Per-metric failures become `warnings` plus `failed` (slugs) exactly like
+`fetchMetricPoints`; 401 throws `unauthorized`, 429 throws `rate_limited`, and
+credentials never appear in an error message or in returned data.
+
+### Storage
+
+Schema version 7 adds two live-only tables. Demo mode never writes to them.
+
+```sql
+CREATE TABLE IF NOT EXISTS workout_samples (
+  source TEXT NOT NULL REFERENCES metric_sources(id) ON DELETE CASCADE,
+  metric TEXT NOT NULL,            -- key from public/workout-metrics-catalog.js
+  at_ms INTEGER NOT NULL,          -- epoch ms UTC (sample time, or interval start)
+  value REAL NOT NULL,             -- catalog unit
+  duration_ms INTEGER,             -- interval width for kind 'interval'; NULL for samples
+  label TEXT,                      -- zone name for 'zone'; NULL otherwise
+  PRIMARY KEY (source, metric, at_ms)
+) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS workout_sample_windows (
+  source TEXT NOT NULL REFERENCES metric_sources(id) ON DELETE CASCADE,
+  workout_id TEXT NOT NULL,        -- no FK: samples are time-addressed and outlive Hevy reconciliation
+  start_ms INTEGER NOT NULL,       -- padded window actually requested
+  end_ms INTEGER NOT NULL,
+  status TEXT NOT NULL,            -- 'complete' | 'empty'
+  detail_json TEXT,                -- { sampleCounts, sourceKey, sourceLabel, warnings } (no tokens)
+  fetched_at TEXT NOT NULL,
+  PRIMARY KEY (source, workout_id)
+) WITHOUT ROWID;
+```
+
+Ledger rules:
+
+- One `BEGIN IMMEDIATE` transaction per window: its samples and its ledger row
+  are written together. A window that comes back with samples replaces its own
+  span (`DELETE` then insert) rather than merging into it, so a re-fetch that
+  picks a different primary source cannot leave the old recorder's samples
+  interleaved with the new ones; samples also upsert by primary key, so a
+  re-fetch of unchanged data is idempotent and overlapping windows share their
+  samples. A window that comes back with nothing deletes nothing, so a transient
+  gap at Google cannot erase stored samples.
+- A window is fetched when (a) it has no ledger row, (b) the stored
+  `start_ms`/`end_ms` differ from the current padded window (Hevy edited the
+  workout times), or (c) its status is `empty` and `fetched_at` is earlier than
+  the workout end plus 48 h, so late-arriving data is picked up. Rule (c)
+  settles itself: the first fetch after that deadline is the last one.
+- A **failed** window (any metric's request failed) writes nothing at all — no
+  samples and no row — so the next sync retries it. A partially written window
+  would look complete forever.
+- Budget: at most 25 windows per sync call, newest workouts first. Padded
+  windows that overlap are merged into one request.
+- The ledger is the progress record; the Google source cursor keeps only
+  `syncedThrough` for the daily series, and the daily sync merges that key into
+  `cursor_json` instead of replacing the object.
+
+### Service API
+
+```js
+syncWorkoutMetrics({ workoutIds = null, budget = 25 } = {})
+  // live only; same token refresh and 401 retry helper as syncMetrics.
+  // -> { fetched, empty, failed: [workoutId], warnings: [string] }
+getWorkoutMetrics(workoutId)             // -> WorkoutMetrics; demo mode is generated, never SQLite
+getWorkoutMetricsOverview({ days = 90 }) // -> Overview; `days` clamped to 7-730
+```
+
+`syncMetrics()` calls `syncWorkoutMetrics({ budget: 25 })` at the end, best
+effort: its warnings are appended to the sync warnings and its failure can never
+fail the daily sync, so the one "Sync Google Health" button covers both. Identical
+warnings are reported once however many windows produced them, so a 25-window
+sync does not put the same sentence on screen 25 times.
+
+`getWorkoutMetricsOverview` needs only `summary` per row, so it asks
+`summariseWorkout` for `detail: false`: no chart series and no segment estimate
+are built for workouts the page only lists. It still reads each fetched window's
+samples, so the cost of the page grows with `days`; moving the heart-rate
+aggregate into SQL is the next step if 730 days becomes slow.
+
+### HTTP routes
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| `GET` | `/api/workouts/:id/metrics` | One workout's samples, summary, and estimated segments. |
+| `POST` | `/api/workouts/:id/metrics/sync` | Fetch just that workout's window (budget 1), then return the same payload. No request body. |
+| `GET` | `/api/metrics/workouts?days=90` | Coverage and one summary row per workout, newest first. |
+
+`GET /api/workouts/:id/metrics` returns:
+
+```json
+{
+  "mode": "live",
+  "workout": { "id": "…", "title": "Full Body 2", "start_time": "…", "end_time": "…" },
+  "status": "ready",
+  "fetched_at": "2026-09-10T10:43:32.256Z",
+  "window": { "start_ms": 1757392410000, "end_ms": 1757396403000 },
+  "source": "Pixel Watch 4",
+  "series": {
+    "heart_rate": { "unit": "bpm", "samples": [[1757392410000, 96]] },
+    "steps": { "unit": "steps", "interval_ms": 60000, "samples": [[1757392380000, 12]] },
+    "calories": { "unit": "kcal", "interval_ms": 60000, "samples": [[1757392380000, 6.4]] },
+    "zone": { "unit": "min", "interval_ms": 60000, "samples": [[1757392380000, 1, "CARDIO"]] }
+  },
+  "summary": {
+    "heart_rate": { "avg": 128, "max": 171, "min": 62, "coverage": 0.94, "sample_count": 3301, "median_interval_ms": 1240 },
+    "calories": 312, "steps": 1840,
+    "zones": { "FAT_BURN": 18, "CARDIO": 22, "PEAK": 6, "none": 5 },
+    "duration_min": 51.5
+  },
+  "exercises": [{ "index": 0, "title": "Barbell Back Squat", "sets": 4, "from_ms": 1757392710000, "to_ms": 1757393500000, "heart_rate": { "avg": 132, "max": 168 } }],
+  "estimated_segments": true
+}
+```
+
+- `status` is `ready`, `empty` (fetched, but Google had nothing — the watch was
+  not worn or has not synced), `unfetched` (no window fetched yet; the browser
+  offers the POST above), or `not_connected` (live mode without a Google
+  connection; point the user at Settings). `fetched_at` is null unless `ready`
+  or `empty`. Every catalog key is always present in `series`, possibly with an
+  empty `samples` array, and every `summary` field except `duration_min` is null
+  when that metric has no data in the window.
+- When Hevy edits a workout's times the stored window no longer matches, so the
+  next sync re-fetches it. Until then the status stays `ready` over the samples
+  that fall inside the new window, which may be incomplete at its edges. That
+  self-heals on the next sync and does not need a status of its own.
+- `samples` are compact arrays sorted by time at raw resolution — the server
+  never resamples. The browser breaks the line when a gap exceeds
+  `max(3 × median interval, 15 s)`.
+- 404 `{ error, code: "workout_not_found" }` is returned **only** for an unknown
+  workout id, never for missing samples.
+- All summaries are clipped to the workout interval; the padding exists only for
+  the chart and is exposed as `window`.
+- `GET /api/metrics/workouts?days=90` returns `{ mode, range, coverage, workouts }`
+  with `coverage: { workouts, with_metrics, unfetched, empty }` and one row per
+  workout — including workouts without metrics, so the page can show coverage.
+  Rows carry `duration_min`, `status`, `exercise_count`, `set_count` (working
+  sets), `volume_kg` (the external-load rule from `docs/architecture.md`), and
+  `heart_rate` / `calories` / `steps` / `zones`, which are null unless the row is
+  `ready`.
+- The two payloads count sets differently, on purpose: a row's `set_count` is
+  **working sets** (warmups excluded, the same rule as every other training
+  total), while `exercises[].sets` in the single-workout payload is **every
+  set** in that exercise, because the segment estimate divides the workout by
+  the time actually spent, and a warmup set takes time too. Label them
+  accordingly rather than comparing one against the other.
+
+### Summaries
+
+`server/workout-metrics.js` is a pure module — window building, merging, the
+"needs fetch" decision, and every number — so the session dialog and the
+overview page always agree.
+
+- **Heart rate**: average, maximum, minimum, `sample_count`, and
+  `median_interval_ms` over the samples inside the workout. `coverage` is the
+  fraction of the workout duration spanned by consecutive samples no further
+  apart than `max(3 × median interval, 15 s)`; longer gaps count as dropouts.
+- **Zone minutes** are wall-clock time, measured from each zoned interval's
+  width clipped to the workout interval — never from its stored value. Google's
+  `active-zone-minutes` value is an **AZM credit**, and a minute in PEAK is
+  awarded 2: counting the credit as elapsed time would report 120 minutes in
+  PEAK for a one-hour workout and drive `none` to zero. The stored sample keeps
+  the credit as-is (`series.zone` samples are `[at_ms, credit, zone]`), because
+  it is the number Fitbit's own weekly AZM goal uses and is worth having later;
+  only `summary.zones` and the overview's `zones` convert to minutes. An
+  interval straddling the workout edge is prorated, and the workout minutes no
+  zone claims are reported as `none`.
+- **Calories and steps** are prorated totals over the same interval.
+- **Exercise segments are estimated.** Hevy stores no per-set timestamps, so the
+  workout duration is divided proportionally to each exercise's set count,
+  weighted by the routine's `rest_seconds` when the workout has a `routine_id`
+  with stored routine exercises (each set is assumed to take 40 s plus its rest,
+  90 s when unknown). `estimated_segments: true` marks the payload, and the UI
+  must label it.
+
+### Demo behaviour
+
+`server/metrics-demo.js` generates workout metrics deterministically from the
+workout id and start time with the same seeded `noise` helper: a resistance
+profile with a warm-up ramp, one spike per estimated set, recovery troughs and
+one or two short dropouts at ~2 s spacing; a distinct sustained profile for the
+`demo-run` cardio session; and minute intervals for steps, calories, and zones
+that follow the same heart-rate curve.
+
+The status is a fixed function of the workout id so that every state the live
+page can reach is visible without live data: ids ending in 7
+(`demo-workout-07/17/27`) report `empty`, ids ending in 3
+(`demo-workout-03/13/23`) stay `unfetched` — which is what puts the dialog's
+"Fetch from Google Health" action and the Workouts page's fetch action on screen
+— and the rest are `ready`. Demo mode branches before SQLite: it never reads or
+writes `workout_samples` or `workout_sample_windows`, and `syncWorkoutMetrics` in
+demo mode is a no-op with a warning. An unfetched demo window therefore stays
+unfetched after a `POST /api/workouts/:id/metrics/sync`: demo mode has no Google
+connection to fetch from, and the route still answers 200 with the unchanged
+payload.
+
 ## Markdown export
 
 `data/exports/metrics.md` contains the source status and a 90-day table (date
@@ -236,4 +484,5 @@ metric's most recent value. Numbers use the catalog decimals and units.
 ## Out of scope for this iteration
 
 AI assistant access to metrics, file importers (Health Connect, Takeout),
-intraday heart rate, workout-level heart rate overlays, and notifications.
+all-day intraday series outside workout windows, `exercise` session data, and
+notifications.

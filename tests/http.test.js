@@ -45,3 +45,45 @@ test('local HTTP interface blocks foreign origins, rebinding, invalid JSON, and 
   assert.equal((await fetch(`${base}/api/demo`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{"enabled":"yes"}' })).status, 400);
   for (const path of ['/data/settings.json', '/server/service.js', '/%2e%2e%2fserver%2fservice.js']) assert.equal((await fetch(base + path)).status, 404);
 });
+
+test('workout metric routes read, sync, and report an unknown workout', async (t) => {
+  const notFound = (id) => Object.assign(new Error('Workout was not found.'), { status: 404, code: 'workout_not_found', id });
+  const syncs = [];
+  const known = new Set(['w1', 'w 2']);
+  const app = createApp({
+    getState: () => ({ mode: 'live' }),
+    getWorkoutMetrics: (id) => {
+      if (!known.has(id)) throw notFound(id);
+      // Missing samples are a status, never a 404.
+      return { mode: 'live', workout: { id }, status: syncs.some((call) => call.workoutIds.includes(id)) ? 'ready' : 'unfetched', series: { heart_rate: { unit: 'bpm', samples: [] } } };
+    },
+    syncWorkoutMetrics: (options) => { syncs.push(options); return { fetched: 1, empty: 0, failed: [], warnings: [] }; },
+    getWorkoutMetricsOverview: ({ days }) => ({ mode: 'live', range: { from: '2026-06-12', to: '2026-09-10' }, coverage: { workouts: 1, with_metrics: 0, unfetched: 1, empty: 0 }, days }),
+  });
+  await new Promise((resolve) => app.listen(0, '127.0.0.1', resolve));
+  t.after(() => new Promise((resolve) => app.close(resolve)));
+  const base = `http://127.0.0.1:${app.address().port}`;
+
+  const unfetched = await fetch(`${base}/api/workouts/w1/metrics`);
+  assert.equal(unfetched.status, 200);
+  assert.deepEqual(await unfetched.json(), { mode: 'live', workout: { id: 'w1' }, status: 'unfetched', series: { heart_rate: { unit: 'bpm', samples: [] } } });
+
+  const missing = await fetch(`${base}/api/workouts/nope/metrics`);
+  assert.equal(missing.status, 404);
+  assert.deepEqual(await missing.json(), { error: 'Workout was not found.', code: 'workout_not_found' });
+
+  // No request body is required, and the response is the workout's metrics.
+  const synced = await fetch(`${base}/api/workouts/w%202/metrics/sync`, { method: 'POST' });
+  assert.equal(synced.status, 200);
+  assert.equal((await synced.json()).status, 'ready');
+  assert.deepEqual(syncs, [{ workoutIds: ['w 2'], budget: 1 }], 'ids are decoded and the budget is one window');
+  assert.equal((await fetch(`${base}/api/workouts/nope/metrics/sync`, { method: 'POST' })).status, 404);
+
+  const overview = await fetch(`${base}/api/metrics/workouts?days=30`);
+  assert.equal(overview.status, 200);
+  assert.deepEqual(await overview.json(), { mode: 'live', range: { from: '2026-06-12', to: '2026-09-10' }, coverage: { workouts: 1, with_metrics: 0, unfetched: 1, empty: 0 }, days: 30 });
+  assert.equal((await (await fetch(`${base}/api/metrics/workouts`)).json()).days, 90);
+  assert.equal((await fetch(`${base}/api/workouts/w1/metrics`, { headers: { Origin: 'https://attacker.example' } })).status, 403);
+  assert.equal((await fetch(`${base}/api/workouts/w1/metrics/sync`, { method: 'POST', headers: { 'Sec-Fetch-Site': 'cross-site' } })).status, 403);
+  assert.equal(syncs.length, 2, 'the cross-site sync never reached the service');
+});

@@ -10,6 +10,7 @@ import {
   refreshAccessToken,
   revokeToken,
   fetchMetricPoints,
+  fetchWorkoutSamples,
 } from '../server/google-health.js';
 
 const SECRET = 'top-secret-client-value';
@@ -24,7 +25,7 @@ function fakeFetch(routes = {}) {
     const parsed = new URL(url);
     const call = { url: parsed, method: options.method || 'GET', headers: options.headers || {}, body: options.body ? JSON.parse(options.body) : null, options };
     calls.push(call);
-    const match = /\/v4\/users\/me\/dataTypes\/([^/]+)\/dataPoints(:dailyRollUp)?$/.exec(parsed.pathname);
+    const match = /\/v4\/users\/me\/dataTypes\/([^/]+)\/dataPoints(:dailyRollUp|:rollUp)?$/.exec(parsed.pathname);
     const route = routes[match?.[1]];
     const result = typeof route === 'function' ? await route(call) : route;
     if (result instanceof Response) return result;
@@ -408,4 +409,128 @@ test('fetchMetricPoints turns per-type failures into warnings and keeps going', 
   // Pages fetched before the cap are kept; the upsert is idempotent.
   assert.deepEqual(byMetric(points, 'calories_kcal').map((point) => [point.date, point.value]), [['2026-03-01', 1], ['2026-03-02', 2]]);
   assert.equal(listCalls(calls, 'sleep').length, 1);
+});
+
+// --- workout samples ---------------------------------------------------------
+
+const WINDOW_START = Date.parse('2026-09-09T04:23:30Z') + 750; // floored in the filter
+const WINDOW_END = Date.parse('2026-09-09T05:30:03Z') + 250;   // rounded up in the filter
+const hrPoint = (time, bpm, source = { platform: 'FITBIT', device: { displayName: 'Pixel Watch 4', formFactor: 'WATCH' } }) => ({
+  name: `users/me/dataTypes/heart-rate/dataPoints/hr-${time}-${source.platform}`,
+  dataSource: { recordingMethod: 'AUTOMATICALLY_RECORDED', ...source },
+  heartRate: { sampleTime: { physicalTime: time, utcOffset: '7200s', civilTime: {} }, beatsPerMinute: String(bpm) },
+});
+const zonePoint = (start, end, zone) => ({ activeZoneMinutes: { interval: { startTime: start, endTime: end }, heartRateZone: zone, activeZoneMinutes: '1' } });
+const bin = (start, end, payload) => ({ startTime: start, endTime: end, ...payload });
+
+test('fetchWorkoutSamples asks for exactly the documented workout requests', async (t) => {
+  const { fetchImpl, calls } = fakeFetch({
+    'heart-rate': (call) => (call.url.searchParams.get('pageToken')
+      ? { dataPoints: [hrPoint('2026-09-09T04:30:02Z', 107)] }
+      : { dataPoints: [hrPoint('2026-09-09T04:30:00Z', 106)], nextPageToken: 'page-2' }),
+    steps: { rollupDataPoints: [bin('2026-09-09T04:30:00Z', '2026-09-09T04:31:00Z', { steps: { countSum: '96' } })] },
+    'total-calories': { rollupDataPoints: [bin('2026-09-09T04:30:00Z', '2026-09-09T04:31:00Z', { totalCalories: { kcalSum: 12.3 } })] },
+    'active-zone-minutes': { dataPoints: [zonePoint('2026-09-09T04:30:00Z', '2026-09-09T04:31:00Z', 'CARDIO')] },
+  });
+  const result = await fetchWorkoutSamples(fetchImpl, TOKEN, { startMs: WINDOW_START, endMs: WINDOW_END });
+  assert.deepEqual(result.warnings, []);
+  assert.deepEqual(result.failed, []);
+
+  const heartRate = listCalls(calls, 'heart-rate');
+  assert.equal(heartRate.length, 2, 'nextPageToken is followed');
+  assert.equal(heartRate[0].method, 'GET');
+  assert.equal(heartRate[0].url.searchParams.get('filter'), 'heart_rate.sample_time.physical_time >= "2026-09-09T04:23:30Z" AND heart_rate.sample_time.physical_time < "2026-09-09T05:30:04Z"');
+  assert.equal(heartRate[0].url.searchParams.get('pageSize'), '5000', 'the live maximum; the default of 50 would truncate a window');
+  assert.equal(heartRate[0].url.searchParams.get('pageToken'), null);
+  assert.equal(heartRate[1].url.searchParams.get('pageToken'), 'page-2');
+  assert.equal(heartRate[0].headers.authorization, `Bearer ${TOKEN}`);
+  assert.equal(listCalls(calls, 'active-zone-minutes')[0].url.searchParams.get('filter'), 'active_zone_minutes.interval.start_time >= "2026-09-09T04:23:30Z" AND active_zone_minutes.interval.start_time < "2026-09-09T05:30:04Z"');
+
+  // total-calories and calories-in-heart-rate-zone reject `list`, so the
+  // interval metrics use the rollUp action with an explicit window size.
+  for (const slug of ['steps', 'total-calories']) {
+    const rollUp = calls.filter((call) => call.url.pathname === `/v4/users/me/dataTypes/${slug}/dataPoints:rollUp`);
+    assert.equal(rollUp.length, 1);
+    assert.equal(rollUp[0].method, 'POST');
+    assert.deepEqual(rollUp[0].body, { range: { startTime: '2026-09-09T04:23:30Z', endTime: '2026-09-09T05:30:04Z' }, windowSize: '60s' });
+    assert.equal(rollUp[0].url.searchParams.get('pageSize'), null);
+  }
+
+  assert.deepEqual(result.samples, [
+    { metric: 'calories', atMs: Date.parse('2026-09-09T04:30:00Z'), value: 12.3, durationMs: 60_000, label: null },
+    { metric: 'heart_rate', atMs: Date.parse('2026-09-09T04:30:00Z'), value: 106, durationMs: null, label: null },
+    { metric: 'steps', atMs: Date.parse('2026-09-09T04:30:00Z'), value: 96, durationMs: 60_000, label: null },
+    { metric: 'zone', atMs: Date.parse('2026-09-09T04:30:00Z'), value: 1, durationMs: 60_000, label: 'CARDIO' },
+    { metric: 'heart_rate', atMs: Date.parse('2026-09-09T04:30:02Z'), value: 107, durationMs: null, label: null },
+  ]);
+  assert.equal(result.sourceKey, 'FITBIT/Pixel Watch 4');
+  assert.equal(result.sourceLabel, 'Pixel Watch 4');
+  assert.doesNotMatch(JSON.stringify(result), new RegExp(TOKEN));
+  await assert.rejects(fetchWorkoutSamples(fetchImpl, '', { startMs: WINDOW_START, endMs: WINDOW_END }), TypeError);
+  await assert.rejects(fetchWorkoutSamples(fetchImpl, TOKEN, { startMs: WINDOW_END, endMs: WINDOW_START }), TypeError);
+  await assert.rejects(fetchWorkoutSamples(fetchImpl, TOKEN, { startMs: WINDOW_START, endMs: WINDOW_START + 25 * 60 * 60 * 1000 }), TypeError);
+});
+
+test('fetchWorkoutSamples keeps one primary heart rate source per window', async () => {
+  const watch = { platform: 'FITBIT', device: { displayName: 'Pixel Watch 4', formFactor: 'WATCH' } };
+  const app = { platform: 'HEALTH_CONNECT', application: { packageName: 'com.hevy' } };
+  const { fetchImpl } = fakeFetch({
+    'heart-rate': {
+      dataPoints: [
+        hrPoint('2026-09-09T04:30:00Z', 100, watch),
+        hrPoint('2026-09-09T04:30:01Z', 180, app),
+        hrPoint('2026-09-09T04:30:02Z', 101, watch),
+        hrPoint('2026-09-09T04:30:03Z', 181, app),
+        hrPoint('2026-09-09T04:30:04Z', 102, watch),
+      ],
+    },
+  });
+  const result = await fetchWorkoutSamples(fetchImpl, TOKEN, { startMs: WINDOW_START, endMs: WINDOW_END });
+  assert.deepEqual(result.samples.map((sample) => sample.value), [100, 101, 102], 'the source with the most samples wins');
+  assert.equal(result.sourceKey, 'FITBIT/Pixel Watch 4');
+  assert.ok(!result.warnings.some((warning) => /other sources/.test(warning)), 'source dedupe is routine, not a warning');
+
+  // A tie goes to the FITBIT platform, then to a device over an application.
+  const tied = fakeFetch({ 'heart-rate': { dataPoints: [hrPoint('2026-09-09T04:30:00Z', 180, app), hrPoint('2026-09-09T04:30:02Z', 100, watch)] } });
+  const picked = await fetchWorkoutSamples(tied.fetchImpl, TOKEN, { startMs: WINDOW_START, endMs: WINDOW_END });
+  assert.equal(picked.sourceKey, 'FITBIT/Pixel Watch 4');
+  assert.deepEqual(picked.samples.map((sample) => sample.value), [100]);
+  const appOnly = fakeFetch({ 'heart-rate': { dataPoints: [hrPoint('2026-09-09T04:30:00Z', 95, app)] } });
+  const fallback = await fetchWorkoutSamples(appOnly.fetchImpl, TOKEN, { startMs: WINDOW_START, endMs: WINDOW_END });
+  assert.equal(fallback.sourceKey, 'HEALTH_CONNECT/com.hevy');
+  assert.equal(fallback.sourceLabel, 'com.hevy');
+});
+
+test('fetchWorkoutSamples reports per-metric failures and rethrows auth and rate limits', async () => {
+  const { fetchImpl, calls } = fakeFetch({
+    'heart-rate': { dataPoints: [hrPoint('2026-09-09T04:30:00Z', 106), { heartRate: { beatsPerMinute: 'n/a' } }] },
+    steps: () => json({ error: { message: 'boom' } }, 500),
+    'total-calories': () => new Response('not json', { status: 200 }),
+    'active-zone-minutes': { dataPoints: 'nope' },
+  });
+  const result = await fetchWorkoutSamples(fetchImpl, TOKEN, { startMs: WINDOW_START, endMs: WINDOW_END });
+  assert.deepEqual(result.failed, ['steps', 'total-calories', 'active-zone-minutes']);
+  assert.deepEqual(result.warnings, [
+    'heart-rate: skipped 1 point without a usable value',
+    'steps: request failed (500)',
+    'total-calories: invalid JSON response',
+    'active-zone-minutes: invalid dataPoints response',
+  ]);
+  assert.deepEqual(result.samples.map((sample) => sample.value), [106], 'the metrics that worked are still returned');
+  assert.equal(calls.length, 4);
+
+  const unauthorized = fakeFetch({ 'heart-rate': () => json({ error: { status: 'UNAUTHENTICATED' } }, 401) });
+  await assert.rejects(
+    fetchWorkoutSamples(unauthorized.fetchImpl, TOKEN, { startMs: WINDOW_START, endMs: WINDOW_END }),
+    (error) => error instanceof GoogleHealthError && error.code === 'unauthorized' && !new RegExp(TOKEN).test(error.message),
+  );
+  assert.equal(unauthorized.calls.length, 1, 'an expired token stops the window immediately');
+  const limited = fakeFetch({ 'heart-rate': () => json({ error: { code: 429 } }, 429) });
+  await assert.rejects(fetchWorkoutSamples(limited.fetchImpl, TOKEN, { startMs: WINDOW_START, endMs: WINDOW_END }), (error) => error.code === 'rate_limited' && error.status === 429);
+
+  // Broken pagination cannot loop forever.
+  const looping = fakeFetch({ 'heart-rate': () => ({ dataPoints: [hrPoint('2026-09-09T04:30:00Z', 106)], nextPageToken: 'again' }) });
+  const capped = await fetchWorkoutSamples(looping.fetchImpl, TOKEN, { startMs: WINDOW_START, endMs: WINDOW_END });
+  assert.deepEqual(capped.failed, ['heart-rate']);
+  assert.equal(listCalls(looping.calls, 'heart-rate').length, 20);
 });

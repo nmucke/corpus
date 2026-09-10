@@ -3,8 +3,14 @@
 // chart-dot). Inputs are point arrays `{ date, value }`; null values leave
 // gaps. Geometry is FULL or COMPACT — pick it from the measured container with
 // `mountChart()` rather than from the call site.
+//
+// `timeSeriesChart` is the one builder whose x-axis is real time rather than an
+// index — the intra-workout heart-rate trace, where a dropout must read as a
+// hole. `zoneBar` is a single horizontal stack and returns plain HTML.
+// No builder ever draws a second y-scale: peer series share one axis.
 
-import { formatDay, formatDuration, formatNumber } from './format.js';
+import { formatDay, formatDuration, formatElapsed, formatNumber } from './format.js';
+import { paddedExtent, splitRuns, timeTicks, zoneClass } from './workout-metrics-analytics.js';
 
 const SVG_NS = 'http://www.w3.org/2000/svg';
 const FULL = { width: 760, left: 50, right: 22, top: 18, bottom: 38, height: 250, divisions: 4, maxLabels: 8 };
@@ -215,11 +221,12 @@ function finish(chart, points, markers, entries, xLabel) {
 }
 
 /**
- * Line chart over point arrays with an optional rolling-mean overlay.
+ * Line chart over point arrays with an optional rolling-mean overlay and any
+ * number of peer series on the same axis (`extras`).
  * Dots are drawn only for series with at most 90 plotted points.
- * @param {{ points: {date:string,value:number|null}[], mean?: (number|null)[], unit?: string, label: string, seriesLabel?: string, decimals?: number, markers?: Set<string>, height?: number, format?: (value:number)=>string, axisFormat?: (value:number)=>string, xLabel?: (point:object,index:number)=>string, xLabels?: number, compact?: boolean }} options
+ * @param {{ points: {date:string,value:number|null}[], mean?: (number|null)[], extras?: {values:(number|null)[],label:string,className?:string,dotClass?:string,legendClass?:string,format?:(value:number)=>string}[], unit?: string, label: string, seriesLabel?: string, decimals?: number, markers?: Set<string>, height?: number, format?: (value:number)=>string, axisFormat?: (value:number)=>string, xLabel?: (point:object,index:number)=>string, xLabels?: number, compact?: boolean }} options
  */
-export function lineChart({ points = [], mean = null, unit = '', label = 'Trend', seriesLabel = '', decimals = 0, markers = null, height = 0, format = null, axisFormat = null, xLabel = null, xLabels = 0, compact = false }) {
+export function lineChart({ points = [], mean = null, extras = [], unit = '', label = 'Trend', seriesLabel = '', decimals = 0, markers = null, height = 0, format = null, axisFormat = null, xLabel = null, xLabels = 0, compact = false }) {
   const chart = frame({ label, height, count: points.length, compact });
   if (xLabels) chart.maxLabels = xLabels;
   const values = points.map((point) => point.value);
@@ -228,7 +235,8 @@ export function lineChart({ points = [], mean = null, unit = '', label = 'Trend'
   const fmt = format || defaultFormat(unit, decimals);
   const axisFmt = axisFormat || ((value) => formatValue(value, decimals));
   const meanValues = Array.isArray(mean) ? mean : [];
-  const range = valueRange([...values, ...meanValues]);
+  const peers = extras.filter((series) => Array.isArray(series?.values) && series.values.some((value) => value != null));
+  const range = valueRange([...values, ...meanValues, ...peers.flatMap((series) => series.values)]);
   const y = (value) => chart.top + (1 - (value - range.min) / (range.max - range.min)) * chart.plotH;
   gridLines(chart, range.min, range.max, axisFmt);
   if (meanValues.length) runs(chart, meanValues, y, 'chart-mean');
@@ -246,6 +254,20 @@ export function lineChart({ points = [], mean = null, unit = '', label = 'Trend'
   }
   const entries = seriesLabel ? [['legend-line', seriesLabel]] : [];
   if (meanValues.some((value) => value != null)) entries.push(['legend-mean', '7-day mean']);
+  // Peer series share the one y-axis (never a second scale) and always bring a
+  // legend entry, so identity never rests on colour alone.
+  for (const series of peers) {
+    runs(chart, series.values, y, series.className || 'chart-line', !dots);
+    if (dots) {
+      const radius = compact ? 2.5 : 3.5;
+      series.values.forEach((value, index) => {
+        if (value == null) return;
+        const dot = svgEl('circle', { cx: chart.x(index), cy: y(value), r: radius, class: `chart-dot ${series.dotClass || ''}`.trim() });
+        chart.svg.append(withTitle(dot, `${labelFor(index)}: ${(series.format || fmt)(value)} · ${series.label}`));
+      });
+    }
+    entries.push([series.legendClass || 'legend-line', series.label]);
+  }
   return finish(chart, points, markers, entries, xLabel);
 }
 
@@ -297,38 +319,51 @@ export function barChart({ points = [], mean = null, overlay = null, unit = '', 
 }
 
 const STAGES = [['deep', 'Deep'], ['light', 'Light'], ['rem', 'REM'], ['awake', 'Awake']];
+/** The sleep stack's own segments, and the shape every caller passes. */
+const SLEEP_SEGMENTS = STAGES.map(([key, label]) => ({ key, label, className: `sleep-${key}` }));
 
 /**
- * Stacked sleep-stage bars from `sleepStack` rows. Nights without stage data
- * draw the total as a plain bar so they still appear.
- * @param {{ rows: {date:string,deep:number|null,light:number|null,rem:number|null,awake:number|null,total:number|null}[], unit?: string, label: string, markers?: Set<string>, height?: number, compact?: boolean }} options
+ * Stacked bars over point-like rows. Each `segments` entry names a numeric field
+ * on the row and the class its slice wears; rows with no segment values draw
+ * `total` as a plain bar so they still appear. Defaults to the sleep stack.
+ * `segmentGap` separates touching slices of one bar — opt in where the palette
+ * is a single-hue ramp; the sleep stack's four hues need no seam.
+ * @param {{ rows: object[], segments?: {key:string,label:string,className:string}[], segmentGap?: number, unit?: string, label: string, seriesNoun?: string, emptyTitle?: string, markers?: Set<string>, height?: number, format?: (value:number)=>string, xLabel?: (row:object,index:number)=>string, xLabels?: number, compact?: boolean }} options
  */
-export function stackedBarChart({ rows = [], unit = 'min', label = 'Sleep stages', markers = null, height = 0, compact = false }) {
+export function stackedBarChart({
+  rows = [], segments = SLEEP_SEGMENTS, segmentGap = 0, unit = 'min', label = 'Sleep stages', seriesNoun = 'asleep',
+  emptyTitle = 'No sleep data in this range', markers = null, height = 0, format = null,
+  xLabel = null, xLabels = 0, compact = false,
+}) {
   const chart = frame({ label, height, count: rows.length, compact });
-  const stageSum = (row) => STAGES.reduce((sum, [stage]) => sum + (row[stage] ?? 0), 0);
-  const hasStages = (row) => STAGES.some(([stage]) => row[stage] != null);
-  const heights = rows.map((row) => (hasStages(row) ? stageSum(row) : row.total));
-  if (!heights.some((value) => value != null)) return emptyChart(chart.wrap, 'No sleep data in this range');
-  const fmt = unit === 'min' ? formatMinutes : (value) => `${formatValue(value)} ${unit}`;
+  if (xLabels) chart.maxLabels = xLabels;
+  const parts = (row) => segments.reduce((sum, segment) => sum + (row[segment.key] ?? 0), 0);
+  const hasParts = (row) => segments.some((segment) => row[segment.key] != null);
+  const heights = rows.map((row) => (hasParts(row) ? parts(row) : row.total));
+  if (!heights.some((value) => value != null)) return emptyChart(chart.wrap, emptyTitle);
+  const fmt = format || (unit === 'min' ? formatMinutes : (value) => `${formatValue(value)} ${unit}`);
   const max = Math.max(...heights.filter((value) => value != null), 1);
-  const scale = (minutes) => (minutes / max) * chart.plotH;
+  const scale = (value) => (value / max) * chart.plotH;
   gridLines(chart, 0, max, (value) => (unit === 'min' ? formatMinutes(value) : formatValue(value)));
+  const labelFor = labeller(rows, xLabel);
   const barW = barWidth(chart);
-  let anyStages = false;
+  let anyParts = false;
   rows.forEach((row, index) => {
     if (heights[index] == null) return;
     const group = svgEl('g');
-    const stageText = STAGES.filter(([stage]) => row[stage] != null).map(([stage, name]) => `${name} ${formatMinutes(row[stage])}`).join(' · ');
-    withTitle(group, `${labelDate(row.date)}: ${fmt(row.total)} asleep${stageText ? ` · ${stageText}` : ''}`);
+    const partText = segments.filter((segment) => row[segment.key] != null)
+      .map((segment) => `${segment.label} ${fmt(row[segment.key])}`).join(' · ');
+    withTitle(group, `${labelFor(index)}: ${fmt(row.total ?? heights[index])} ${seriesNoun}${partText ? ` · ${partText}` : ''}`);
     const x = chart.x(index) - barW / 2;
-    if (hasStages(row)) {
-      anyStages = true;
+    if (hasParts(row)) {
+      anyParts = true;
       let cursor = chart.bottom;
-      for (const [stage] of STAGES) {
-        if (!row[stage]) continue;
-        const h = scale(row[stage]);
+      for (const segment of segments) {
+        if (!row[segment.key]) continue;
+        const h = scale(row[segment.key]);
         cursor -= h;
-        group.append(svgEl('rect', { x, y: cursor, width: barW, height: h, class: `chart-bar sleep-${stage}` }));
+        // The seam is taken out of the slice, so the stack still totals correctly.
+        group.append(svgEl('rect', { x, y: cursor, width: barW, height: segmentGap ? Math.max(1, h - segmentGap) : h, class: `chart-bar ${segment.className}` }));
       }
     } else {
       const h = scale(row.total);
@@ -336,6 +371,175 @@ export function stackedBarChart({ rows = [], unit = 'min', label = 'Sleep stages
     }
     chart.svg.append(group);
   });
-  const entries = anyStages ? STAGES.map(([stage, name]) => [`sleep-${stage}`, name]) : [];
-  return finish(chart, rows, markers, entries, null);
+  const entries = anyParts ? segments.map((segment) => [segment.className, segment.label]) : [];
+  return finish(chart, rows, markers, entries, xLabel);
+}
+
+/* ------------------------------------------------- intra-workout time series */
+
+/** Per-character width of `.chart-axis` text in viewBox units, for label fitting. */
+const CHAR_W = 5.4;
+const HR_HEIGHT = { full: 264, compact: 212 };
+
+/** The full title when it fits inside the band, else the ordinal, else nothing. */
+function fitLabel(segment, width) {
+  const number = segment.number == null ? '' : String(segment.number);
+  const title = String(segment.title || '');
+  const fits = (text) => text && text.length * CHAR_W + 10 <= width;
+  const full = number ? `${number} · ${title}` : title;
+  if (fits(full)) return full;
+  return fits(number) ? number : '';
+}
+
+/** Index of the sample nearest `at` in a time-sorted `[ms, value]` array. */
+function nearestIndex(points, at) {
+  let low = 0, high = points.length - 1;
+  while (low < high) {
+    const middle = (low + high) >> 1;
+    if (points[middle][0] < at) low = middle + 1; else high = middle;
+  }
+  if (low > 0 && Math.abs(points[low - 1][0] - at) <= Math.abs(points[low][0] - at)) return low - 1;
+  return low;
+}
+
+/**
+ * A raw sample trace on a true time axis — the heart-rate view inside one
+ * workout. Unlike `lineChart`, x is elapsed time rather than an index, so a
+ * dropout leaves a real hole: runs are split wherever the spacing exceeds
+ * `gapMs`, and no dots are drawn at this density.
+ *
+ * `segments` are 0–1 fractions of the window (see `layoutSegments`); `bounds`
+ * draws the rule pair marking the logged start and end inside the padded window.
+ *
+ * @param {{ samples: [number, number][], window: {startMs:number,endMs:number}, origin?: number|null, bounds?: {startMs:number,endMs:number}|null, segments?: object[], gapMs?: number|null, unit?: string, label: string, decimals?: number, format?: (value:number)=>string, readout?: (point:[number,number], elapsed:number)=>string, hint?: string, height?: number, compact?: boolean, emptyTitle?: string }} options
+ */
+export function timeSeriesChart({
+  samples = [], window: domain = {}, origin = null, bounds = null, segments = [], gapMs = null,
+  unit = 'bpm', label = 'Heart rate', decimals = 0, format = null, readout = null,
+  hint = 'Move across the trace for a reading', height = 0, compact = false,
+  emptyTitle = 'No samples in this window',
+}) {
+  const chart = frame({ label, height: height || (compact ? HR_HEIGHT.compact : HR_HEIGHT.full), count: 1, compact });
+  const start = Number(domain.startMs), end = Number(domain.endMs);
+  const runs = splitRuns(samples, gapMs);
+  const points = runs.flat();
+  if (!points.length || !Number.isFinite(start) || !Number.isFinite(end) || end <= start) {
+    return emptyChart(chart.wrap, emptyTitle, 'Nothing was recorded for this session.');
+  }
+  const span = end - start;
+  const zero = Number.isFinite(Number(origin)) ? Number(origin) : start;
+  const range = paddedExtent(points.map((point) => point[1]));
+  const fmt = format || defaultFormat(unit, decimals);
+  const xAt = (at) => chart.left + ((at - start) / span) * chart.plotW;
+  const yAt = (value) => chart.top + (1 - (value - range.min) / (range.max - range.min)) * chart.plotH;
+
+  // Bands sit under the grid so the trace and the gridlines stay legible.
+  for (const segment of segments) {
+    const left = chart.left + segment.from * chart.plotW;
+    const width = Math.max(1, (segment.to - segment.from) * chart.plotW);
+    const band = svgEl('rect', { x: left, y: chart.top, width, height: chart.plotH, class: `chart-band${segment.band ? ' is-alt' : ''}` });
+    const detail = segment.heartRate?.avg != null ? ` · avg ${fmt(segment.heartRate.avg)}` : '';
+    chart.svg.append(withTitle(band, `${segment.title}${detail} · estimated window`));
+    const text = fitLabel(segment, width);
+    if (text) {
+      const caption = svgEl('text', { x: left + 5, y: chart.top + 12, class: 'chart-axis chart-band-label' });
+      caption.textContent = text;
+      chart.svg.append(caption);
+    }
+  }
+
+  gridLines(chart, range.min, range.max, (value) => formatValue(value, decimals));
+
+  for (const [key, text] of [['startMs', 'Workout start'], ['endMs', 'Workout end']]) {
+    const at = Number(bounds?.[key]);
+    if (!Number.isFinite(at) || at < start || at > end) continue;
+    const rule = svgEl('line', { x1: xAt(at), x2: xAt(at), y1: chart.top, y2: chart.bottom, class: 'chart-rule' });
+    chart.svg.append(withTitle(rule, text));
+  }
+
+  for (const run of runs) {
+    if (run.length === 1) {
+      chart.svg.append(svgEl('circle', { cx: xAt(run[0][0]), cy: yAt(run[0][1]), r: 2, class: 'chart-line-point' }));
+      continue;
+    }
+    chart.svg.append(svgEl('polyline', { points: run.map((point) => `${xAt(point[0])},${yAt(point[1])}`).join(' '), class: 'chart-line' }));
+  }
+
+  const ticks = timeTicks(Math.max(0, end - zero), { max: chart.maxLabels });
+  for (const tick of ticks) {
+    const at = zero + tick.ms;
+    if (at < start || at > end) continue;
+    const x = xAt(at);
+    const anchor = x - chart.left < 14 ? 'start' : chart.width - chart.right - x < 14 ? 'end' : 'middle';
+    const text = svgEl('text', { x, y: chart.height - 9, class: 'chart-axis', 'text-anchor': anchor });
+    text.textContent = formatElapsed(tick.ms);
+    chart.svg.append(text);
+  }
+
+  const crosshair = svgEl('line', { x1: 0, x2: 0, y1: chart.top, y2: chart.bottom, class: 'chart-crosshair' });
+  const focus = svgEl('circle', { cx: 0, cy: 0, r: 4, class: 'chart-focus-dot' });
+  crosshair.setAttribute('opacity', '0');
+  focus.setAttribute('opacity', '0');
+  const overlay = svgEl('rect', { x: chart.left, y: chart.top, width: chart.plotW, height: chart.plotH, class: 'chart-hover-layer' });
+  chart.svg.append(crosshair, focus, overlay);
+
+  // One line under the chart: it explains the chart until a reading replaces it.
+  const readoutRow = el('p', 'chart-readout');
+  readoutRow.textContent = hint;
+  const describe = readout || ((point, elapsed) => `${formatElapsed(elapsed)} · ${fmt(point[1])}`);
+  const clear = () => {
+    crosshair.setAttribute('opacity', '0');
+    focus.setAttribute('opacity', '0');
+    readoutRow.textContent = hint;
+    readoutRow.classList.remove('is-live');
+  };
+  overlay.addEventListener('pointermove', (event) => {
+    const box = overlay.getBoundingClientRect();
+    if (!box.width) return;
+    const at = start + Math.min(1, Math.max(0, (event.clientX - box.left) / box.width)) * span;
+    const point = points[nearestIndex(points, at)];
+    crosshair.setAttribute('x1', xAt(point[0]));
+    crosshair.setAttribute('x2', xAt(point[0]));
+    crosshair.setAttribute('opacity', '1');
+    focus.setAttribute('cx', xAt(point[0]));
+    focus.setAttribute('cy', yAt(point[1]));
+    focus.setAttribute('opacity', '1');
+    readoutRow.textContent = describe(point, point[0] - zero);
+    readoutRow.classList.add('is-live');
+  });
+  overlay.addEventListener('pointerleave', clear);
+  overlay.addEventListener('pointercancel', clear);
+  chart.wrap.append(readoutRow);
+  return chart.wrap;
+}
+
+/**
+ * Heart-rate zone minutes as one horizontal stacked bar plus a legend carrying
+ * the numbers. Rows come from `zoneRows`; the bar is decorative because the
+ * legend states every value in text.
+ * @param {{ rows: {key:string,label:string,className?:string,minutes:number,share:number}[], format?: (minutes:number)=>string }} options
+ */
+export function zoneBar({ rows = [], format = null }) {
+  const fmt = format || formatMinutes;
+  const block = el('div', 'zone-bar-block');
+  const track = el('div', 'zone-bar');
+  track.setAttribute('aria-hidden', 'true');
+  const legendRow = el('div', 'chart-legend zone-legend');
+  let drawn = 0;
+  for (const row of rows) {
+    const paint = row.className || zoneClass(row.key);
+    if (row.share > 0) {
+      const fill = el('span', `zone-fill ${paint}`);
+      fill.style.width = `${row.share * 100}%`;
+      fill.title = `${row.label}: ${fmt(row.minutes)}`;
+      track.append(fill);
+      drawn++;
+    }
+    const item = el('span');
+    item.append(el('i', paint), document.createTextNode(`${row.label} ${fmt(row.minutes)}`));
+    legendRow.append(item);
+  }
+  if (!drawn) return emptyChart(block, 'No zone minutes', 'Google Health recorded no time in a heart-rate zone.');
+  block.append(track, legendRow);
+  return block;
 }

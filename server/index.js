@@ -95,6 +95,17 @@ export function createApp(service, { assistantToken = null } = {}) {
       }
       if (req.method === 'GET' && path === '/api/state') return json(res, 200, await service.getState());
       if (req.method === 'GET' && path === '/api/metrics') return json(res, 200, await service.getMetrics({ days: url.searchParams.has('days') ? Number(url.searchParams.get('days')) : 90 }));
+      if (req.method === 'GET' && path === '/api/metrics/workouts') return json(res, 200, await service.getWorkoutMetricsOverview({ days: url.searchParams.has('days') ? Number(url.searchParams.get('days')) : 90 }));
+      const workoutMetrics = path.match(/^\/api\/workouts\/([^/]+)\/metrics$/);
+      if (req.method === 'GET' && workoutMetrics) return json(res, 200, await service.getWorkoutMetrics(decodeURIComponent(workoutMetrics[1])));
+      // Fetching one workout's window takes no request body, so it is answered
+      // before the generic JSON POST handling below.
+      const workoutMetricsSync = path.match(/^\/api\/workouts\/([^/]+)\/metrics\/sync$/);
+      if (req.method === 'POST' && workoutMetricsSync) {
+        const workoutId = decodeURIComponent(workoutMetricsSync[1]);
+        await service.syncWorkoutMetrics({ workoutIds: [workoutId], budget: 1 });
+        return json(res, 200, await service.getWorkoutMetrics(workoutId));
+      }
       if (req.method === 'POST') {
         const payload = await body(req);
         let result;

@@ -1,4 +1,5 @@
 import { createHash, randomBytes } from 'node:crypto';
+import { WORKOUT_METRICS } from '../public/workout-metrics-catalog.js';
 
 // Google Health API v4 adapter. Pure functions over an injected fetchImpl,
 // mirroring server/hevy.js. See docs/metrics.md ("Source decision", "Adapter").
@@ -10,6 +11,11 @@ const TIMEOUT_MS = 20_000;
 // A full year is roughly 40 requests; this is a hard stop for broken pagination.
 const MAX_PAGES = 200;
 const DAY_MS = 86_400_000;
+// Workout windows: the live API caps pageSize at 5000 (default 50) and a padded
+// workout window holds at most a few thousand raw heart-rate samples.
+const WORKOUT_PAGE_SIZE = 5000;
+const MAX_WORKOUT_PAGES = 20;
+const MAX_WORKOUT_WINDOW_MS = 24 * 60 * 60 * 1000;
 const DEFAULT_EXPIRES_IN = 3600;
 
 export const SCOPES = [
@@ -279,18 +285,20 @@ function listFilter(type, from, to) {
   return `${type.filterField} >= "${addDays(from, -1)}T00:00:00Z" AND ${type.filterField} < "${addDays(to, 2)}T00:00:00Z"`;
 }
 
-async function* listItems(fetchImpl, accessToken, type, from, to) {
+// The one paginated `dataPoints` list used by both the daily series and the
+// workout windows; they differ only in the filter, the page size, and the cap.
+async function* pagedDataPoints(fetchImpl, accessToken, slug, filter, pageSize, maxPages) {
   let pageToken = null;
-  for (let page = 1; page <= MAX_PAGES; page += 1) {
-    const url = new URL(`${API_BASE}/${type.slug}/dataPoints`);
-    url.searchParams.set('filter', listFilter(type, from, to));
-    url.searchParams.set('pageSize', String(type.pageSize));
+  for (let page = 1; page <= maxPages; page += 1) {
+    const url = new URL(`${API_BASE}/${slug}/dataPoints`);
+    url.searchParams.set('filter', filter);
+    url.searchParams.set('pageSize', String(pageSize));
     if (pageToken) url.searchParams.set('pageToken', pageToken);
     const json = await request(fetchImpl, url.toString(), accessToken, { method: 'GET' });
     yield* itemsOf(json, 'dataPoints');
     pageToken = nextToken(json);
     if (!pageToken) return;
-    if (page === MAX_PAGES) throw new GoogleHealthError('invalid_response', `stopped after ${MAX_PAGES} pages`, 502);
+    if (page === maxPages) throw new GoogleHealthError('invalid_response', `stopped after ${maxPages} pages`, 502);
   }
 }
 
@@ -356,7 +364,9 @@ export async function fetchMetricPoints(fetchImpl, accessToken, { from, to } = {
   for (const type of DATA_TYPES) {
     let skipped = 0;
     try {
-      const items = type.method === 'dailyRollUp' ? rollupItems(fetchImpl, accessToken, type, from, to) : listItems(fetchImpl, accessToken, type, from, to);
+      const items = type.method === 'dailyRollUp'
+        ? rollupItems(fetchImpl, accessToken, type, from, to)
+        : pagedDataPoints(fetchImpl, accessToken, type.slug, listFilter(type, from, to), type.pageSize, MAX_PAGES);
       for await (const item of items) {
         const mapped = mapItem(type, item);
         if (!mapped) { skipped += 1; continue; }
@@ -371,4 +381,131 @@ export async function fetchMetricPoints(fetchImpl, accessToken, { from, to } = {
   }
   // `failed` lists data types whose request failed outright; skipped points are warnings only.
   return { points: [...points.values()], warnings, failed };
+}
+
+// --- workout samples ---------------------------------------------------------
+
+// High-frequency data inside one workout window. The catalog row drives the
+// request (slug, method, windowSeconds); this table only adds what the wire
+// format needs, so a new metric is one catalog row plus one entry here.
+const WORKOUT_FIELDS = {
+  heart_rate: {
+    filterField: 'heart_rate.sample_time.physical_time',
+    payload: 'heartRate',
+    // Live shape: beatsPerMinute is an int64 string, sampleTime.physicalTime an RFC 3339 instant.
+    map: (payload) => {
+      const atMs = Date.parse(payload?.sampleTime?.physicalTime ?? '');
+      const value = toNumber(payload?.beatsPerMinute);
+      return Number.isFinite(atMs) && value !== null ? { atMs, value, durationMs: null, label: null } : null;
+    },
+  },
+  steps: { payload: 'steps', map: (payload) => ({ value: toNumber(payload?.countSum) }) },
+  calories: { payload: 'totalCalories', map: (payload) => ({ value: toNumber(payload?.kcalSum) }) },
+  zone: {
+    filterField: 'active_zone_minutes.interval.start_time',
+    payload: 'activeZoneMinutes',
+    // Only minutes that reached a zone are reported, one interval each.
+    map: (payload) => {
+      const atMs = Date.parse(payload?.interval?.startTime ?? '');
+      const endMs = Date.parse(payload?.interval?.endTime ?? '');
+      const value = toNumber(payload?.activeZoneMinutes);
+      const zone = typeof payload?.heartRateZone === 'string' ? payload.heartRateZone : null;
+      return Number.isFinite(atMs) && value !== null ? { atMs, value, durationMs: Number.isFinite(endMs) && endMs > atMs ? endMs - atMs : 60_000, label: zone } : null;
+    },
+  },
+};
+
+// RFC 3339 at second precision: the live filter parser accepts `...Z` instants.
+function rfc3339(ms, roundUp = false) {
+  const seconds = roundUp ? Math.ceil(ms / 1000) : Math.floor(ms / 1000);
+  return new Date(seconds * 1000).toISOString().replace(/\.\d{3}Z$/, 'Z');
+}
+
+function sourceOf(item) {
+  const source = item?.dataSource && typeof item.dataSource === 'object' ? item.dataSource : {};
+  const platform = typeof source.platform === 'string' && source.platform ? source.platform : 'UNKNOWN';
+  const device = source.device && typeof source.device === 'object' ? source.device : null;
+  const application = source.application && typeof source.application === 'object' ? source.application : null;
+  const label = [device?.displayName, application?.displayName, application?.name, application?.packageName].find((value) => typeof value === 'string' && value) ?? platform;
+  return { key: `${platform}/${label}`, label, platform, device: Boolean(device) };
+}
+
+// Two watches (or a watch and a phone app) can both record heart rate for the
+// same minutes. Interleaving them would invent noise, so one primary source per
+// window wins: most samples, then a FITBIT platform, then a device over an app.
+function primarySource(entries) {
+  const sources = new Map();
+  for (const entry of entries) {
+    const current = sources.get(entry.source.key) ?? { ...entry.source, count: 0 };
+    current.count += 1;
+    sources.set(entry.source.key, current);
+  }
+  const ranked = [...sources.values()].sort((a, b) => b.count - a.count
+    || Number(b.platform === 'FITBIT') - Number(a.platform === 'FITBIT')
+    || Number(b.device) - Number(a.device)
+    || a.key.localeCompare(b.key));
+  return ranked[0] ?? null;
+}
+
+// Only `>=` and `<` are supported by the live filter parser.
+function workoutFilter(type, startMs, endMs) {
+  return `${type.filterField} >= "${rfc3339(startMs)}" AND ${type.filterField} < "${rfc3339(endMs, true)}"`;
+}
+
+async function workoutRollupItems(fetchImpl, accessToken, type, startMs, endMs) {
+  const body = { range: { startTime: rfc3339(startMs), endTime: rfc3339(endMs, true) }, windowSize: `${type.windowSeconds ?? 60}s` };
+  const json = await request(fetchImpl, `${API_BASE}/${type.slug}/dataPoints:rollUp`, accessToken, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
+  return itemsOf(json, 'rollupDataPoints');
+}
+
+// Everything recorded inside one (padded) workout window, in catalog units.
+// Pure over the injected fetch; credentials never appear in errors or results.
+export async function fetchWorkoutSamples(fetchImpl, accessToken, { startMs, endMs } = {}) {
+  if (typeof accessToken !== 'string' || !accessToken) throw new TypeError('An access token is required.');
+  if (!Number.isFinite(startMs) || !Number.isFinite(endMs) || endMs <= startMs) throw new TypeError('startMs and endMs must be epoch milliseconds with endMs after startMs.');
+  if (endMs - startMs > MAX_WORKOUT_WINDOW_MS) throw new TypeError('A workout window cannot span more than 24 hours.');
+  const samples = [];
+  const warnings = [];
+  const failed = [];
+  let sourceKey = null;
+  let sourceLabel = null;
+  for (const metric of WORKOUT_METRICS) {
+    const type = { ...metric, ...WORKOUT_FIELDS[metric.key] };
+    if (!type.map) { warnings.push(`${metric.slug}: no payload mapper`); failed.push(metric.slug); continue; }
+    const collected = [];
+    let skipped = 0;
+    try {
+      const items = metric.method === 'rollUp'
+        ? await workoutRollupItems(fetchImpl, accessToken, type, startMs, endMs)
+        : pagedDataPoints(fetchImpl, accessToken, type.slug, workoutFilter(type, startMs, endMs), WORKOUT_PAGE_SIZE, MAX_WORKOUT_PAGES);
+      for await (const item of items) {
+        const payload = item?.[type.payload] && typeof item[type.payload] === 'object' ? item[type.payload] : null;
+        const mapped = payload ? type.map(payload, item) : null;
+        // Roll-up bins carry their own interval; samples carry their own time.
+        const atMs = mapped?.atMs ?? Date.parse(item?.startTime ?? '');
+        const width = mapped?.durationMs ?? (Number.isFinite(Date.parse(item?.endTime ?? '')) ? Date.parse(item.endTime) - atMs : (metric.windowSeconds ?? 0) * 1000);
+        if (!mapped || mapped.value === null || !Number.isFinite(mapped.value) || !Number.isFinite(atMs)) { skipped += 1; continue; }
+        collected.push({ metric: metric.key, atMs, value: mapped.value, durationMs: metric.kind === 'interval' ? (width > 0 ? width : (metric.windowSeconds ?? 60) * 1000) : null, label: mapped.label ?? null, source: sourceOf(item) });
+      }
+    } catch (error) {
+      if (error instanceof GoogleHealthError && FATAL_CODES.has(error.code)) throw error;
+      warnings.push(`${metric.slug}: ${error instanceof GoogleHealthError ? error.message : 'could not map the response'}`);
+      failed.push(metric.slug);
+      continue;
+    }
+    if (skipped > 0) warnings.push(`${metric.slug}: skipped ${skipped} point${skipped === 1 ? '' : 's'} without a usable value`);
+    let kept = collected;
+    // Every listed data type can come back from two overlapping recorders; a
+    // roll-up is already aggregated across sources by Google, so it has none.
+    if (metric.method === 'list') {
+      const primary = primarySource(collected);
+      if (primary) {
+        kept = collected.filter((entry) => entry.source.key === primary.key);
+        if (!sourceKey) { sourceKey = primary.key; sourceLabel = primary.label; }
+      }
+    }
+    for (const entry of kept) samples.push({ metric: entry.metric, atMs: entry.atMs, value: entry.value, durationMs: entry.durationMs, label: entry.label });
+  }
+  samples.sort((a, b) => a.atMs - b.atMs || a.metric.localeCompare(b.metric));
+  return { samples, sourceKey, sourceLabel, warnings, failed };
 }

@@ -2,6 +2,10 @@
 // Both are built entirely on the shared helpers from `context()` (heading,
 // periodPicker, statCard, panelHeader, emptyState, miniMetric, format, period).
 //
+// The panel/loader/period scaffolding every Metrics view shares is exported from
+// here (`panel`, `chartPanel`, `loadingPanel`, `failurePanel`, `markPeriod`,
+// `loadBody`) so metrics-workouts.js keeps the same shapes and timings.
+//
 // Fetching: the widest window (MAX_FETCH_DAYS) is fetched once per data mode
 // and cached, then every range is sliced client-side by metrics-analytics.js.
 // A range change is therefore instant — the body never collapses to a loader.
@@ -124,19 +128,19 @@ function connectedSource(ctx, data) {
 
 /* ------------------------------------------------------------------- panels */
 
-function panel(ctx, ...children) { return ctx.add(ctx.node('section', 'panel'), ...children); }
+export function panel(ctx, ...children) { return ctx.add(ctx.node('section', 'panel'), ...children); }
 
-function loadingPanel(ctx) {
+export function loadingPanel(ctx, copy = 'Loading health metrics…') {
   const { node, add } = ctx;
   const status = node('div', 'loading-block');
   status.setAttribute('role', 'status');
-  add(status, node('span', 'loader'), node('p', '', 'Loading health metrics…'));
+  add(status, node('span', 'loader'), node('p', '', copy));
   return panel(ctx, status);
 }
 
-function failurePanel(ctx, error, retry) {
+export function failurePanel(ctx, error, retry, title = 'Couldn’t load metrics') {
   return panel(ctx, ctx.emptyState({
-    title: 'Couldn’t load metrics',
+    title,
     copy: error.message || 'Check that the local server is still running.',
     icon: '!',
     action: ctx.button('Try again', { variant: 'secondary', onClick: retry }),
@@ -209,7 +213,7 @@ function chartSubtitle(metric, unit) {
  * `mountChart`, which picks the geometry from the measured container — the
  * call site never passes `compact` (D12).
  */
-function chartPanel(ctx, title, subtitle, build) {
+export function chartPanel(ctx, title, subtitle, build) {
   const { node } = ctx;
   const mount = node('div', 'chart-mount');
   mountChart(mount, build);
@@ -219,7 +223,7 @@ function chartPanel(ctx, title, subtitle, build) {
 /* ------------------------------------------------------------ view plumbing */
 
 /** Keeps the picker's pressed state in sync when only the body re-renders. */
-function markPeriod(picker, value) {
+export function markPeriod(picker, value) {
   for (const control of picker.querySelectorAll('button')) {
     control.setAttribute('aria-pressed', String(control.dataset.period === value));
   }
@@ -229,29 +233,34 @@ function markPeriod(picker, value) {
  * Fills `body` from cache when possible. On a first paint it shows a loader
  * panel; on a range change it keeps the rendered body, reserves its height and
  * dims it until the data lands, so the page never collapses (DASH-8).
+ *
+ * `options` is reused for the retry, so every Metrics view passes one object:
+ * `{ view, body, fill, cached, load, loadingCopy?, failTitle? }` where `cached`
+ * returns the cached payload or null and `load` returns a promise of it.
  */
-function loadBody(ctx, view, body, fill) {
-  const cached = cachedMetrics(ctx);
-  if (cached) { fill(cached); return; }
+export function loadBody(ctx, options) {
+  const { view, body, fill, cached, load, loadingCopy, failTitle = 'Couldn’t load metrics' } = options;
+  const ready = cached ? cached() : null;
+  if (ready) { fill(ready); return; }
   if (body.childElementCount) {
     body.style.minHeight = `${body.offsetHeight}px`;
     body.setAttribute('aria-busy', 'true');
     body.classList.add('is-refreshing');
   } else {
-    body.replaceChildren(loadingPanel(ctx));
+    body.replaceChildren(loadingPanel(ctx, loadingCopy));
   }
   const settle = () => {
     body.style.minHeight = '';
     body.removeAttribute('aria-busy');
     body.classList.remove('is-refreshing');
   };
-  loadMetrics(ctx)
+  load()
     .then((data) => { if (!view.isConnected) return; settle(); fill(data); })
     .catch((error) => {
       if (!view.isConnected) return;
       settle();
-      body.replaceChildren(failurePanel(ctx, error, () => loadBody(ctx, view, body, fill)));
-      ctx.toast('Couldn’t load metrics', error.message || 'Please try again.', 'error');
+      body.replaceChildren(failurePanel(ctx, error, () => loadBody(ctx, options), failTitle));
+      ctx.toast(failTitle, error.message || 'Please try again.', 'error');
     });
 }
 
@@ -260,10 +269,16 @@ function metricsView(ctx, title, description, buildBody, extraActions = []) {
   const { node, add } = ctx;
   const view = node('section', 'view section-page');
   const body = node('div', 'panel-stack');
-  const fill = (data) => body.replaceChildren(...buildBody(ctx, data));
-  const picker = ctx.periodPicker((value) => { markPeriod(picker, value); loadBody(ctx, view, body, fill); });
+  const options = {
+    view,
+    body,
+    fill: (data) => body.replaceChildren(...buildBody(ctx, data)),
+    cached: () => cachedMetrics(ctx),
+    load: () => loadMetrics(ctx),
+  };
+  const picker = ctx.periodPicker((value) => { markPeriod(picker, value); loadBody(ctx, options); });
   add(view, ctx.heading('Metrics', title, description, ...extraActions, picker), body);
-  loadBody(ctx, view, body, fill);
+  loadBody(ctx, options);
   return view;
 }
 

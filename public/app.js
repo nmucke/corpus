@@ -10,6 +10,8 @@ import {
   workoutVolume,
 } from "./analytics.js";
 import { invalidateMetrics, renderMetricsDashboard, renderMetricsTrends } from "./metrics.js";
+import { invalidateWorkoutMetrics, renderMetricsWorkouts } from "./metrics-workouts.js";
+import { workoutMetricsSection } from "./workout-metrics.js";
 import { renderPrograms as renderProgramsModule, renderProgramProgress } from "./programs.js";
 import { localDateKey, matchingPrograms, programTimeline } from "./program-timeline.js";
 import { pendingCount, renderProposals } from "./proposals.js";
@@ -22,10 +24,12 @@ import {
   NOT_SET,
   convertKg,
   dateLabel,
+  formatBpm,
   formatCompact,
   formatDateTime,
   formatDay,
   formatDuration,
+  formatElapsed,
   formatLoad,
   formatNumber,
   formatSeconds,
@@ -140,7 +144,7 @@ function titleCase(value) { return String(value || "").replaceAll("_", " ").repl
 
 function route() {
   const value = location.hash.slice(1).split("/")[0];
-  return ["overview", "sessions", "programs", "proposals", "exercises", "metrics", "metrics-trends", "settings"].includes(value) ? value : "overview";
+  return ["overview", "sessions", "programs", "proposals", "exercises", "metrics", "metrics-trends", "metrics-workouts", "settings"].includes(value) ? value : "overview";
 }
 
 /* ---------------------------------------------------------------- helpers */
@@ -307,6 +311,7 @@ async function setMode(enableDemo, control = modeToggle) {
   try {
     await api("/api/demo", { method: "POST", body: JSON.stringify({ enabled: enableDemo }) });
     invalidateMetrics();
+    invalidateWorkoutMetrics();
     await loadState();
     const copy = MODE_COPY.toast[enableDemo ? "demo" : "live"];
     toast(copy.title, copy.body);
@@ -334,6 +339,7 @@ async function syncAll() {
     if (hevy) {
       try {
         await api("/api/sync", { method: "POST", body: "{}" });
+        invalidateWorkoutMetrics();
         done.push("hevy");
       } catch (error) {
         toast("Couldn’t sync Hevy", error.message || "Please try again.", "error");
@@ -343,6 +349,7 @@ async function syncAll() {
       try {
         const result = await api("/api/metrics/sync", { method: "POST", body: "{}" });
         invalidateMetrics();
+        invalidateWorkoutMetrics();
         imported = Number(result?.imported) || 0;
         warnings.push(...(Array.isArray(result?.warnings) ? result.warnings.filter(Boolean) : []));
         done.push("google");
@@ -698,6 +705,10 @@ function showSession(workout) {
   const date = add(node("div"), node("span", "", "Started"), node("strong", "", formatDateTime(workout.start_time)));
   add(meta, date, duration, volume);
   add(content, meta, sessionProgramBadges(workout, true));
+  // The dialog is built synchronously and `.dialog` has no width until it is
+  // open, so the section is mounted here and only fetches once it is on screen.
+  const metrics = workoutMetricsSection(context(), workout);
+  content.append(metrics.element);
   for (const exercise of workout.exercises || []) {
     const section = node("section", "exercise-detail");
     add(section, node("h3", "card-title", exercise.title || "Untitled exercise"));
@@ -722,6 +733,7 @@ function showSession(workout) {
   }
   content.append(add(node("div", "dialog-actions"), button("Close", { onClick: () => dialog.close() })));
   openDialog("Session", workout.title || "Untitled workout", content);
+  metrics.start();
 }
 
 /* ----------------------------------------------------------------- exercises */
@@ -815,10 +827,12 @@ function context() {
     syncAll,
     titleCase,
     sessionRow,
+    showSession,
     format: {
       MISSING, NOT_SET, NEVER_SYNCED, MISSING_ROUTINE,
       formatNumber, formatCompact, formatDuration, formatSeconds, formatDay,
       formatDateTime, dateLabel, formatLoad, formatSet, convertKg, plural,
+      formatElapsed, formatBpm,
     },
     period: {
       list: PERIODS,
@@ -876,6 +890,7 @@ function render() {
     case "exercises": view = renderExercises(); break;
     case "metrics": view = renderMetricsDashboard(context()); break;
     case "metrics-trends": view = renderMetricsTrends(context()); break;
+    case "metrics-workouts": view = renderMetricsWorkouts(context()); break;
     case "settings": view = renderSettingsModule(context()); break;
     default: view = renderOverview();
   }
