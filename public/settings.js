@@ -1,5 +1,7 @@
 import { MODE_COPY } from "./app.js";
 import { invalidateMetrics } from "./metrics.js";
+import { invalidateWorkoutMetrics } from "./metrics-workouts.js";
+import { invalidateSupplementDoses } from "./supplements.js";
 
 /** One string for every stored secret, on every card (SET-7). */
 const SAVED_PLACEHOLDER = "Saved locally — leave blank to keep it";
@@ -109,6 +111,9 @@ function hevyCard(ctx) {
         setBusy(sync, true);
         try {
           const result = await api("/api/sync", { method: "POST", body: "{}" });
+          // New sessions change workout metrics coverage and the derived workout doses.
+          invalidateWorkoutMetrics();
+          invalidateSupplementDoses();
           await refresh();
           const count = Array.isArray(result?.workouts) ? result.workouts.length : 0;
           const extra = result?.mode === "demo" ? " Switch to live data to see the changes." : "";
@@ -231,6 +236,7 @@ function googleCard(ctx) {
         try {
           const result = await api("/api/metrics/sync", { method: "POST", body: "{}" });
           invalidateMetrics();
+          invalidateWorkoutMetrics();
           await refresh();
           const imported = Number(result?.imported) || 0;
           const warnings = (Array.isArray(result?.warnings) ? result.warnings : []).filter(Boolean);

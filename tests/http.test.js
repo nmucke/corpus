@@ -87,3 +87,54 @@ test('workout metric routes read, sync, and report an unknown workout', async (t
   assert.equal((await fetch(`${base}/api/workouts/w1/metrics/sync`, { method: 'POST', headers: { 'Sec-Fetch-Site': 'cross-site' } })).status, 403);
   assert.equal(syncs.length, 2, 'the cross-site sync never reached the service');
 });
+
+test('supplement routes read doses, save, log, and delete without confusing ids', async (t) => {
+  const calls = [];
+  const record = (name, ...args) => { calls.push([name, ...args]); return { ok: name }; };
+  const app = createApp({
+    getState: () => ({ mode: 'live' }),
+    getSupplementDoses: ({ days }) => ({ mode: 'live', range: { from: '2026-06-12', to: '2026-09-10' }, doses: [], days }),
+    saveSupplement: (payload) => { calls.push(['saveSupplement', payload]); return { id: 's1', name: payload.name }; },
+    deleteSupplement: (id) => record('deleteSupplement', id),
+    logDose: (id, payload) => { calls.push(['logDose', id, payload]); return { dose: { id: 'd1', supplement_id: id } }; },
+    deleteDose: (id) => record('deleteDose', id),
+  });
+  await new Promise((resolve) => app.listen(0, '127.0.0.1', resolve));
+  t.after(() => new Promise((resolve) => app.close(resolve)));
+  const base = `http://127.0.0.1:${app.address().port}`;
+  const jsonHeaders = { 'Content-Type': 'application/json' };
+
+  const doses = await fetch(`${base}/api/supplements/doses?days=30`);
+  assert.equal(doses.status, 200);
+  assert.equal((await doses.json()).days, 30);
+  assert.equal((await (await fetch(`${base}/api/supplements/doses`)).json()).days, 90, 'days defaults to 90');
+
+  const saved = await fetch(`${base}/api/supplements`, { method: 'POST', headers: jsonHeaders, body: '{"name":"Creatine"}' });
+  assert.equal(saved.status, 200);
+  assert.deepEqual(await saved.json(), { id: 's1', name: 'Creatine' });
+
+  const logged = await fetch(`${base}/api/supplements/s%201/doses`, { method: 'POST', headers: jsonHeaders, body: '{"amount":5}' });
+  assert.equal(logged.status, 200);
+  assert.deepEqual(await logged.json(), { dose: { id: 'd1', supplement_id: 's 1' } });
+  assert.equal((await fetch(`${base}/api/supplements/s1/doses`, { method: 'POST', body: '{}' })).status, 415);
+
+  // The literal `doses` segment must never be read as a supplement id.
+  const removedDose = await fetch(`${base}/api/supplements/doses/abc`, { method: 'DELETE' });
+  assert.equal(removedDose.status, 200);
+  assert.deepEqual(await removedDose.json(), { ok: 'deleteDose' });
+  const removed = await fetch(`${base}/api/supplements/s%201`, { method: 'DELETE' });
+  assert.equal(removed.status, 200);
+  assert.deepEqual(await removed.json(), { ok: 'deleteSupplement' });
+
+  assert.deepEqual(calls, [
+    ['saveSupplement', { name: 'Creatine' }],
+    ['logDose', 's 1', { amount: 5 }],
+    ['deleteDose', 'abc'],
+    ['deleteSupplement', 's 1'],
+  ], 'ids are decoded and deleteSupplement never saw the doses path');
+
+  assert.equal((await fetch(`${base}/api/supplements/doses/abc/extra`, { method: 'DELETE' })).status, 404);
+  assert.equal((await fetch(`${base}/api/supplements/nope`, { method: 'PUT', headers: jsonHeaders, body: '{}' })).status, 404);
+  assert.equal((await fetch(`${base}/api/supplements/doses`, { headers: { Origin: 'https://attacker.example' } })).status, 403);
+  assert.equal(calls.length, 4, 'the cross-site read never reached the service');
+});

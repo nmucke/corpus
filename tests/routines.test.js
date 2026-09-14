@@ -96,10 +96,23 @@ test('a known Hevy rejection removes the ledger record so the corrected same req
     if (posts === 1) return new Response(JSON.stringify({ error: 'bad routine' }), { status: 400 });
     return new Response(JSON.stringify({ id: 'corrected-routine', title: 'Corrected', exercises: [] }), { status: 201 });
   });
-  await assert.rejects(service.createRoutine(draft()), { code: 'routine_rejected' });
+  await assert.rejects(service.createRoutine(draft()), (error) => error.code === 'routine_rejected' && error.message === 'Hevy rejected this routine: bad routine');
   const result = await service.createRoutine({ ...draft(), title: 'Corrected' });
   assert.equal(result.routine.id, 'corrected-routine');
   assert.equal(posts, 2);
+});
+
+test('keeps the legacy nullable rep range shape for routine creates', async (t) => {
+  let posted;
+  const { service } = await serviceFor(t, async (options) => {
+    posted = JSON.parse(options.body);
+    return new Response(JSON.stringify({ id: 'routine-with-fixed-reps', title: 'Strength A', exercises: [] }), { status: 201 });
+  });
+  const body = draft();
+  body.exercises[0].sets[0] = { ...body.exercises[0].sets[0], reps: 5, rep_range: null };
+  await service.createRoutine(body);
+  assert.equal(Object.hasOwn(posted.routine.exercises[0].sets[0], 'rep_range'), true);
+  assert.equal(posted.routine.exercises[0].sets[0].rep_range, null);
 });
 
 test('successful request ids survive a service restart and malformed local cache returns a warning without reposting', async (t) => {

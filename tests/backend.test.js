@@ -127,7 +127,7 @@ test('programs remain scoped to the selected data mode and export has no secret'
   assert.equal(service.getState().programs.length, 1);
   await service.saveSettings({ apiKey: 'private-test-secret' });
   const result = await service.exportMarkdown();
-  assert.deepEqual(result.files, ['exports/workouts.md', 'exports/routines.md', 'exports/overview.md', 'exports/programs.md', 'exports/metrics.md']);
+  assert.deepEqual(result.files, ['exports/workouts.md', 'exports/routines.md', 'exports/overview.md', 'exports/programs.md', 'exports/metrics.md', 'exports/supplements.md']);
   const output = await readFile(path.join(dataDir, 'exports', 'overview.md'), 'utf8');
   assert.match(output, /Demo data/);
   assert.doesNotMatch(output, /private-test-secret/);

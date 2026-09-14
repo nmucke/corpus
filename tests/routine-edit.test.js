@@ -19,12 +19,14 @@ function snapshot(url) {
   return new Response(JSON.stringify({ page: 1, page_count: 1, [resource]: resource === 'routines' ? [routine] : resource === 'exercise_templates' ? [template] : [] }));
 }
 
-async function serviceFor(t, handler) {
+async function serviceFor(t, handler, { readBack = routine } = {}) {
   const dataDir = await mkdtemp(path.join(os.tmpdir(), 'corpus-routine-edit-'));
   const calls = [];
   const service = await createService({ dataDir, fetchImpl: async (url, options = {}) => {
     calls.push({ url: new URL(url), options });
-    return options.method === 'PUT' ? handler(options) : snapshot(url);
+    if (options.method === 'PUT') return handler(options);
+    if (new URL(url).pathname === `/v1/routines/${routine.id}`) return new Response(JSON.stringify({ routine: readBack }));
+    return snapshot(url);
   } });
   t.after(async () => { service.close(); await rm(dataDir, { recursive: true, force: true }); });
   await service.saveSettings({ apiKey: 'routine-edit-key' });
@@ -49,7 +51,7 @@ test('updates the same routine with PUT and preserves nullable and hidden metada
   assert.equal(sent.routine.exercises[0].superset_id, 4);
   assert.equal(sent.routine.exercises[0].sets[0].custom_metric, 12);
   assert.equal(sent.routine.exercises[0].sets[0].weight_kg, 0);
-  assert.equal(sent.routine.exercises[0].sets[0].rep_range, null);
+  assert.equal(Object.hasOwn(sent.routine.exercises[0].sets[0], 'rep_range'), false);
   assert.equal(result.routine.id, 'routine-1');
   assert.equal(service.getState().routines[0].title, 'New title');
   assert.deepEqual(service.getState().programs[0], program);
@@ -107,4 +109,41 @@ test('an update response for a different routine cannot overwrite the local reco
   await assert.rejects(service.updateRoutine(routine.id, { requestId, title: 'Changed' }), { code: 'publication_uncertain' });
   assert.deepEqual(service.getState().routines.map(r => r.id), [routine.id]);
   assert.equal(service.getState().routines[0].title, 'Old title');
+});
+
+test('surfaces Hevy routine validation details for rejected edits', async (t) => {
+  const { service } = await serviceFor(t, async () => new Response(JSON.stringify({ error: 'Expected object, received null' }), { status: 400 }));
+  await assert.rejects(
+    service.updateRoutine(routine.id, { requestId, title: 'Rejected edit' }),
+    (error) => error.code === 'routine_rejected' && error.status === 400 && error.message === 'Hevy rejected this routine: Expected object, received null',
+  );
+});
+
+test('treats a bodyless 2xx PUT as confirmed and caches the submitted routine', async (t) => {
+  let puts = 0;
+  const { service } = await serviceFor(t, async () => {
+    puts += 1;
+    return new Response(null, { status: 204 });
+  });
+  const result = await service.updateRoutine(routine.id, { requestId, title: 'Confirmed without body' });
+  assert.equal(result.routine.id, routine.id);
+  assert.equal(result.routine.title, 'Confirmed without body');
+  assert.equal(result.routine.exercises[0].title, template.title);
+  assert.equal(service.getState().routines[0].title, 'Confirmed without body');
+  await service.updateRoutine(routine.id, { requestId, title: 'Confirmed without body' });
+  assert.equal(puts, 1);
+});
+
+test('verifies an ambiguous PUT by reading Hevy and never retries the write', async (t) => {
+  let puts = 0;
+  const readBack = { ...routine, title: 'Committed before disconnect' };
+  const { service, calls } = await serviceFor(t, async () => {
+    puts += 1;
+    throw new TypeError('connection closed after write');
+  }, { readBack });
+  const result = await service.updateRoutine(routine.id, { requestId, title: readBack.title });
+  assert.equal(result.routine.title, readBack.title);
+  assert.equal(service.getState().routines[0].title, readBack.title);
+  assert.equal(puts, 1);
+  assert.equal(calls.filter(({ url, options }) => !options.method && url.pathname === `/v1/routines/${routine.id}`).length, 1);
 });

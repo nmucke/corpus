@@ -94,7 +94,7 @@ test('schema version 6 metric tables stay in place and demo metrics never touch 
   const { service, dataDir } = await withService(t, async () => { throw new Error('not called'); });
   const db = new DatabaseSync(path.join(dataDir, 'corpus.sqlite'), { readOnly: true });
   t.after(() => db.close());
-  assert.equal(db.prepare('SELECT value FROM meta WHERE key = ?').get('schema_version').value, '7');
+  assert.equal(db.prepare('SELECT value FROM meta WHERE key = ?').get('schema_version').value, '8');
   const names = db.prepare("SELECT name FROM sqlite_master WHERE name IN ('metric_sources', 'metric_points', 'metric_points_by_metric_date') ORDER BY name").all().map((row) => row.name);
   assert.deepEqual(names, ['metric_points', 'metric_points_by_metric_date', 'metric_sources']);
   const metrics = service.getMetrics({ days: 90 });
@@ -402,7 +402,7 @@ test('schema version 7 adds the workout sample tables and demo workout metrics n
   const { service, dataDir } = await withService(t, async () => { throw new Error('not called'); });
   const db = new DatabaseSync(path.join(dataDir, 'corpus.sqlite'), { readOnly: true });
   t.after(() => db.close());
-  assert.equal(db.prepare('SELECT value FROM meta WHERE key = ?').get('schema_version').value, '7');
+  assert.equal(db.prepare('SELECT value FROM meta WHERE key = ?').get('schema_version').value, '8');
   const names = db.prepare("SELECT name FROM sqlite_master WHERE name IN ('workout_samples', 'workout_sample_windows') ORDER BY name").all().map((row) => row.name);
   assert.deepEqual(names, ['workout_sample_windows', 'workout_samples']);
 

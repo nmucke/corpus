@@ -3,18 +3,20 @@ import { mkdir, readFile, rename, writeFile, chmod } from 'node:fs/promises';
 import path from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import { demoState } from './demo.js';
-import { fetchSnapshot, postRoutine, updateRoutine as putRoutine, ROUTINE_UNCERTAIN_MESSAGE, ROUTINE_UPDATE_UNCERTAIN_MESSAGE } from './hevy.js';
+import { fetchRoutine, fetchSnapshot, postRoutine, updateRoutine as putRoutine, ROUTINE_UNCERTAIN_MESSAGE, ROUTINE_UPDATE_UNCERTAIN_MESSAGE } from './hevy.js';
 import { programTimeline, validateProgramSchedule } from '../public/program-timeline.js';
 import { METRICS, METRIC_KEYS, isMetricKey } from '../public/metrics-catalog.js';
 import { entityHash, proposalDraft, publicProposal } from './proposals.js';
 import { demoMetricSeries, demoWorkoutMetrics, demoWorkoutMetricsOverview } from './metrics-demo.js';
 import { SCOPES, GoogleHealthError, pkcePair, authorizationUrl, exchangeCode, refreshAccessToken, revokeToken, fetchMetricPoints, fetchWorkoutSamples } from './google-health.js';
 import { isWorkoutMetricKey } from '../public/workout-metrics-catalog.js';
+import { DOSE_UNITS } from '../public/supplements-catalog.js';
 import { workoutWindow, mergeWindows, needsFetch, summariseWorkout, overviewRow, coverageCounts, blankMetrics, parseTimeMs } from './workout-metrics.js';
+import { validateSupplement, validateDose, frequencyLabel, supplementStatus, workoutDoses, scheduledDoses } from './supplements.js';
 
 export { entityHash } from './proposals.js';
 
-const SCHEMA_VERSION = 7;
+const SCHEMA_VERSION = 8;
 const GOOGLE_SOURCE = 'google-health';
 const OAUTH_PENDING_MS = 10 * 60 * 1000;
 const METRICS_FIRST_SYNC_DAYS = 365;
@@ -44,6 +46,7 @@ function cleanText(value, max, name, required = false) {
   if (result.length > max) throw new ServiceError('validation', `${name} is too long.`);
   return result;
 }
+function fail(code, message, status = 400) { throw new ServiceError(code, message, status); }
 function isoNow() { return new Date().toISOString(); }
 function safeId(value) { return typeof value === 'string' && value.length > 0 && value.length <= 255; }
 const DAY_MS = 86_400_000;
@@ -100,16 +103,23 @@ function initialise(db) {
     CREATE TABLE IF NOT EXISTS metric_points (source TEXT NOT NULL REFERENCES metric_sources(id) ON DELETE CASCADE, metric TEXT NOT NULL, source_id TEXT NOT NULL, date TEXT NOT NULL, start_time TEXT, end_time TEXT, value REAL NOT NULL, raw_json TEXT, imported_at TEXT NOT NULL, PRIMARY KEY(source, metric, source_id));
     CREATE INDEX IF NOT EXISTS metric_points_by_metric_date ON metric_points(metric, date);
     CREATE TABLE IF NOT EXISTS workout_samples (source TEXT NOT NULL REFERENCES metric_sources(id) ON DELETE CASCADE, metric TEXT NOT NULL, at_ms INTEGER NOT NULL, value REAL NOT NULL, duration_ms INTEGER, label TEXT, PRIMARY KEY (source, metric, at_ms)) WITHOUT ROWID;
-    CREATE TABLE IF NOT EXISTS workout_sample_windows (source TEXT NOT NULL REFERENCES metric_sources(id) ON DELETE CASCADE, workout_id TEXT NOT NULL, start_ms INTEGER NOT NULL, end_ms INTEGER NOT NULL, status TEXT NOT NULL, detail_json TEXT, fetched_at TEXT NOT NULL, PRIMARY KEY (source, workout_id)) WITHOUT ROWID;`);
+    CREATE TABLE IF NOT EXISTS workout_sample_windows (source TEXT NOT NULL REFERENCES metric_sources(id) ON DELETE CASCADE, workout_id TEXT NOT NULL, start_ms INTEGER NOT NULL, end_ms INTEGER NOT NULL, status TEXT NOT NULL, detail_json TEXT, fetched_at TEXT NOT NULL, PRIMARY KEY (source, workout_id)) WITHOUT ROWID;
+    CREATE TABLE IF NOT EXISTS supplements (id TEXT PRIMARY KEY, mode TEXT NOT NULL, name TEXT NOT NULL, brand TEXT NOT NULL DEFAULT '', type TEXT NOT NULL, dose_amount REAL NOT NULL, dose_unit TEXT NOT NULL, frequency_json TEXT NOT NULL, timing TEXT NOT NULL DEFAULT '', start_date TEXT NOT NULL, end_date TEXT, purchase_url TEXT, package_size REAL, ingredients TEXT NOT NULL DEFAULT '', notes TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS supplement_doses (id TEXT PRIMARY KEY, supplement_id TEXT NOT NULL REFERENCES supplements(id) ON DELETE CASCADE, taken_at TEXT NOT NULL, date TEXT NOT NULL, amount REAL NOT NULL, workout_id TEXT, slot TEXT, note TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL);
+    CREATE UNIQUE INDEX IF NOT EXISTS supplement_doses_workout ON supplement_doses(supplement_id, workout_id) WHERE workout_id IS NOT NULL;
+    CREATE INDEX IF NOT EXISTS supplement_doses_by_date ON supplement_doses(supplement_id, date);`);
   const programColumns = new Set(db.prepare('PRAGMA table_info(programs)').all().map((column) => column.name));
   const mappingColumns = new Set(db.prepare('PRAGMA table_info(local_routine_mappings)').all().map((column) => column.name));
-  const needsMigration = !version || Number(version) < SCHEMA_VERSION || !programColumns.has('start_date') || !programColumns.has('duration_weeks') || !mappingColumns.has('result_json');
+  // `slot` arrived inside version 8, so the version alone does not prove it is there.
+  const doseColumns = new Set(db.prepare('PRAGMA table_info(supplement_doses)').all().map((column) => column.name));
+  const needsMigration = !version || Number(version) < SCHEMA_VERSION || !programColumns.has('start_date') || !programColumns.has('duration_weeks') || !mappingColumns.has('result_json') || !doseColumns.has('slot');
   if (needsMigration) {
     try {
       db.exec('BEGIN IMMEDIATE');
       if (!programColumns.has('start_date')) db.exec('ALTER TABLE programs ADD COLUMN start_date TEXT');
       if (!programColumns.has('duration_weeks')) db.exec('ALTER TABLE programs ADD COLUMN duration_weeks INTEGER');
       if (!mappingColumns.has('result_json')) db.exec('ALTER TABLE local_routine_mappings ADD COLUMN result_json TEXT');
+      if (!doseColumns.has('slot')) db.exec('ALTER TABLE supplement_doses ADD COLUMN slot TEXT');
       if (!version) db.prepare('INSERT INTO meta(key, value) VALUES (?, ?)').run('schema_version', String(SCHEMA_VERSION));
       else db.prepare('UPDATE meta SET value = ? WHERE key = ?').run(String(SCHEMA_VERSION), 'schema_version');
       db.exec('COMMIT');
@@ -118,6 +128,8 @@ function initialise(db) {
       throw error;
     }
   }
+  // After the column check, so a version-8 database that predates `slot` is altered before the index reads it.
+  db.exec('CREATE UNIQUE INDEX IF NOT EXISTS supplement_doses_slot ON supplement_doses(supplement_id, slot) WHERE slot IS NOT NULL');
   if (!db.prepare('SELECT value FROM meta WHERE key = ?').get('mode')) db.prepare('INSERT INTO meta(key, value) VALUES (?, ?)').run('mode', 'demo');
 }
 
@@ -239,7 +251,11 @@ function buildRoutinePayload(body, templateIds, { existing = null, editing = fal
         }
       }
       if (reps != null && rep_range) throw new ServiceError('validation', 'A set cannot contain both reps and rep_range.');
-      const result = { type: set.type, weight_kg, reps, rep_range, duration_seconds, distance_meters };
+      const result = { type: set.type, weight_kg, reps, duration_seconds, distance_meters };
+      // Hevy's live PUT validator rejects `rep_range: null` even though the
+      // published schema marks the field nullable. Keep the legacy POST shape
+      // for request-id/hash compatibility, but omit an absent range on edits.
+      if (!editing || rep_range !== null) result.rep_range = rep_range;
       if (editing) {
         const savedSet = savedExercise.sets?.[setIndex] ?? {};
         const metadataSet = metadataExercise.sets?.[setIndex] ?? {};
@@ -255,6 +271,36 @@ function buildRoutinePayload(body, templateIds, { existing = null, editing = fal
   });
   const folder_id = editing ? metadataNumber(existing?.folder_id ?? null, 'folder_id') : null;
   return { requestId: body.requestId, payload: { routine: { title, notes, folder_id, exercises } } };
+}
+
+function routineWriteShape(routine) {
+  const nullable = (value) => value == null ? null : value;
+  const repRange = (value) => value == null || (value.start == null && value.end == null)
+    ? null
+    : { start: nullable(value.start), end: nullable(value.end) };
+  return {
+    title: nullable(routine?.title),
+    folder_id: nullable(routine?.folder_id),
+    exercises: (routine?.exercises ?? []).map((exercise) => ({
+      exercise_template_id: nullable(exercise?.exercise_template_id),
+      superset_id: nullable(exercise?.superset_id),
+      rest_seconds: nullable(exercise?.rest_seconds),
+      notes: nullable(exercise?.notes),
+      sets: (exercise?.sets ?? []).map((set) => ({
+        type: nullable(set?.type),
+        weight_kg: nullable(set?.weight_kg),
+        reps: nullable(set?.reps),
+        rep_range: repRange(set?.rep_range),
+        duration_seconds: nullable(set?.duration_seconds),
+        distance_meters: nullable(set?.distance_meters),
+        custom_metric: nullable(set?.custom_metric),
+      })),
+    })),
+  };
+}
+
+function sameRoutineWrite(left, right) {
+  return stableJson(routineWriteShape(left)) === stableJson(routineWriteShape(right));
 }
 
 function cacheRoutine(db, item) {
@@ -333,6 +379,16 @@ function upsertSnapshot(db, snapshot) {
   db.prepare('INSERT INTO meta(key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value').run('mode', 'live');
 }
 
+const SUPPLEMENT_COLUMNS = 'id, name, brand, type, dose_amount, dose_unit, frequency_json, timing, start_date, end_date, purchase_url, package_size, ingredients, notes, created_at, updated_at';
+const SUPPLEMENT_STATUS_ORDER = { active: 0, upcoming: 1, ended: 2 };
+// A frequency that cannot be read is treated as unscheduled rather than
+// failing the whole state read; nothing is expected of it.
+function parseFrequency(value) { try { const frequency = parse(value); return frequency && typeof frequency === 'object' ? frequency : { kind: 'as_needed' }; } catch { return { kind: 'as_needed' }; } }
+function publicSupplement(row, today) {
+  const frequency = parseFrequency(row.frequency_json);
+  return { id: row.id, name: row.name, brand: row.brand, type: row.type, dose_amount: row.dose_amount, dose_unit: row.dose_unit, frequency, frequency_label: frequencyLabel(frequency), timing: row.timing, start_date: row.start_date, end_date: row.end_date, status: supplementStatus(row, today), purchase_url: row.purchase_url, package_size: row.package_size, ingredients: row.ingredients, notes: row.notes, created_at: row.created_at, updated_at: row.updated_at };
+}
+
 function markdownValue(value) {
   if (value == null || value === '') return null;
   return typeof value === 'object' ? JSON.stringify(value) : String(value);
@@ -373,6 +429,41 @@ function markdownFor(state) {
     programLines.push('');
   }
   return { 'workouts.md': workoutLines.join('\n'), 'routines.md': routineLines.join('\n'), 'overview.md': overviewLines.join('\n'), 'programs.md': programLines.join('\n') };
+}
+
+// Matches the browser's formatDose: count units pluralise (`2 capsules`), measures do not (`5 g`).
+function doseText(amount, unit) {
+  const entry = DOSE_UNITS.find((candidate) => candidate.key === unit);
+  return `${amount} ${entry ? (amount === 1 ? entry.label : entry.plural) : unit}`;
+}
+
+// Where the dose came from, in the same words the dialogs use: a scheduled dose
+// is assumed taken, so the export has to say which rows the user chose.
+function doseSource(dose) {
+  if (dose.workout_title) return `with ${dose.workout_title}`;
+  if (dose.source === 'workout') return 'with a workout';
+  return dose.source === 'schedule' ? 'Scheduled' : 'Manual';
+}
+
+function supplementsMarkdown({ mode, range, doses }, list) {
+  const lines = ['# Supplements', ''];
+  if (mode === 'demo') lines.push('> **Demo data** — these supplements were entered against the demo mode.', '');
+  if (!list.length) lines.push('- No supplements yet', '');
+  for (const supplement of list) {
+    lines.push(`## ${supplement.name}`, '');
+    lines.push(`- Type: ${supplement.type}`, `- Brand: ${supplement.brand || 'Not set'}`, `- Dose: ${doseText(supplement.dose_amount, supplement.dose_unit)}`, `- Frequency: ${supplement.frequency_label}`, `- Status: ${supplement.status}`, `- Timing: ${supplement.timing || 'Not set'}`, `- Started: ${supplement.start_date}`, `- Ends: ${supplement.end_date || 'Ongoing'}`, `- Package: ${supplement.package_size == null ? 'Not set' : `${doseText(supplement.package_size, supplement.dose_unit)}`}`, `- Where to buy: ${supplement.purchase_url || 'Not set'}`);
+    if (supplement.ingredients) lines.push('', '### Ingredients', '', supplement.ingredients);
+    if (supplement.notes) lines.push('', '### Notes', '', supplement.notes);
+    const recent = doses.filter((dose) => dose.supplement_id === supplement.id);
+    lines.push('', `### Doses ${range.from} to ${range.to}`, '');
+    if (!recent.length) lines.push('- None');
+    // A scheduled dose belongs to its civil day, not to an hour: its stored
+    // instant is a local midnight, which reads as the day before once it is
+    // written in UTC. Only a real instant (manual, or a logged session) keeps one.
+    for (const dose of recent) lines.push(`- ${dose.slot ? dose.date : dose.taken_at}: ${dose.skipped ? 'Skipped' : `${doseText(dose.amount, dose.unit)}`} (${doseSource(dose)})${dose.note ? ` — ${dose.note}` : ''}`);
+    lines.push('');
+  }
+  return lines.join('\n');
 }
 
 function metricsMarkdown(metrics) {
@@ -634,6 +725,53 @@ export async function createService({ dataDir, fetchImpl = globalThis.fetch } = 
     return result;
   };
 
+  // --- supplements -----------------------------------------------------------
+  const modeWorkouts = (currentMode) => (currentMode === 'demo' ? demoState().workouts : liveWorkouts());
+  const supplements = (currentMode, today = localDate()) => db.prepare(`SELECT ${SUPPLEMENT_COLUMNS} FROM supplements WHERE mode = ?`).all(currentMode)
+    .map((row) => publicSupplement(row, today))
+    .sort((a, b) => SUPPLEMENT_STATUS_ORDER[a.status] - SUPPLEMENT_STATUS_ORDER[b.status] || a.name.localeCompare(b.name));
+  const supplementRow = (id, currentMode) => db.prepare(`SELECT ${SUPPLEMENT_COLUMNS} FROM supplements WHERE id = ? AND mode = ?`).get(id, currentMode) ?? null;
+  // Overrides are read without a date filter: a skip recorded today can belong
+  // to an older session, so the stored row's own date says nothing about the
+  // derived dose it replaces.
+  const supplementOverrides = (currentMode) => {
+    const byWorkout = new Map(); const bySlot = new Map();
+    for (const row of db.prepare('SELECT d.id, d.supplement_id, d.amount, d.workout_id, d.slot, d.note FROM supplement_doses d JOIN supplements s ON s.id = d.supplement_id WHERE s.mode = ? AND (d.workout_id IS NOT NULL OR d.slot IS NOT NULL)').all(currentMode)) {
+      const target = row.workout_id ? byWorkout : bySlot;
+      if (!target.has(row.supplement_id)) target.set(row.supplement_id, new Map());
+      target.get(row.supplement_id).set(row.workout_id ?? row.slot, row);
+    }
+    return { byWorkout, bySlot };
+  };
+  // Stored manual rows plus the doses the schedule and the mode's current
+  // workouts imply. An override for a workout that is gone, or for a slot the
+  // schedule no longer generates, matches nothing and drops out.
+  const doseRows = (currentMode, from, to, today = localDate()) => {
+    const list = supplements(currentMode, today);
+    const units = new Map(list.map((supplement) => [supplement.id, supplement.dose_unit]));
+    const linked = list.filter((supplement) => supplement.frequency.kind === 'workout');
+    const scheduled = list.filter((supplement) => supplement.frequency.kind === 'daily' || supplement.frequency.kind === 'weekly');
+    const workouts = linked.length ? modeWorkouts(currentMode) : [];
+    const overrides = linked.length || scheduled.length ? supplementOverrides(currentMode) : { byWorkout: new Map(), bySlot: new Map() };
+    const doses = db.prepare('SELECT d.id, d.supplement_id, d.taken_at, d.date, d.amount, d.note FROM supplement_doses d JOIN supplements s ON s.id = d.supplement_id WHERE s.mode = ? AND d.workout_id IS NULL AND d.slot IS NULL AND d.date >= ? AND d.date <= ?').all(currentMode, from, to)
+      .map((row) => ({ id: row.id, supplement_id: row.supplement_id, taken_at: row.taken_at, date: row.date, amount: row.amount, unit: units.get(row.supplement_id) ?? null, workout_id: null, slot: null, workout_title: null, source: 'manual', skipped: row.amount === 0, note: row.note }));
+    for (const supplement of linked) {
+      for (const dose of workoutDoses(supplement, workouts, overrides.byWorkout.get(supplement.id))) {
+        if (dose.date < from || dose.date > to) continue;
+        doses.push({ ...dose, unit: supplement.dose_unit });
+      }
+    }
+    for (const supplement of scheduled) {
+      for (const dose of scheduledDoses(supplement, { from, to, today }, overrides.bySlot.get(supplement.id))) doses.push({ ...dose, unit: supplement.dose_unit });
+    }
+    return doses.sort((a, b) => Date.parse(b.taken_at) - Date.parse(a.taken_at));
+  };
+  const supplementDoses = ({ days = 90 } = {}) => {
+    const count = clampDays(days); const currentMode = mode();
+    const to = localDate(); const from = addDays(to, -(count - 1));
+    return { mode: currentMode, range: { from, to }, doses: doseRows(currentMode, from, to, to) };
+  };
+
   const programs = (currentMode) => db.prepare('SELECT id, title, description, days_json, start_date, duration_weeks, created_at, updated_at FROM programs WHERE mode = ? ORDER BY created_at').all(currentMode).map(({ days_json, ...program }) => ({ ...program, days: parse(days_json) }));
   const visibleRoutines = (currentMode) => {
     const base = currentMode === 'demo' ? demoState().routines : db.prepare('SELECT raw_json FROM routines ORDER BY title, id').all().map((row) => parse(row.raw_json));
@@ -652,7 +790,7 @@ export async function createService({ dataDir, fetchImpl = globalThis.fetch } = 
     const data = currentMode === 'demo'
       ? demoState()
       : { workouts: db.prepare('SELECT raw_json FROM workouts ORDER BY start_time DESC, id').all().map((row) => parse(row.raw_json)), routines: db.prepare('SELECT raw_json FROM routines ORDER BY title, id').all().map((row) => parse(row.raw_json)), exerciseTemplates: db.prepare('SELECT raw_json FROM exercise_templates ORDER BY title, id').all().map((row) => parse(row.raw_json)) };
-    return { mode: currentMode, settings: publicSettings(), ...data, routines: visibleRoutines(currentMode), programs: programs(currentMode), proposals: proposalRows(currentMode), trainingProfile: trainingProfile(currentMode) };
+    return { mode: currentMode, settings: publicSettings(), ...data, routines: visibleRoutines(currentMode), programs: programs(currentMode), supplements: supplements(currentMode), proposals: proposalRows(currentMode), trainingProfile: trainingProfile(currentMode) };
   };
 
   return {
@@ -955,8 +1093,21 @@ export async function createService({ dataDir, fetchImpl = globalThis.fetch } = 
         try { existing = parse(saved.raw_json); } catch { throw new ServiceError('bad_response', 'The saved routine cache is invalid. Sync before editing.', 502); }
         const apiKey = activeKey();
         if (!apiKey) throw new ServiceError('no_api_key', 'Add a Hevy API key before editing a routine.');
-        const templateIds = new Set(db.prepare('SELECT id FROM exercise_templates').all().map(({ id: templateId }) => templateId));
+        const templateRows = db.prepare('SELECT id, title FROM exercise_templates').all();
+        const templateIds = new Set(templateRows.map(({ id: templateId }) => templateId));
+        const templateTitles = new Map(templateRows.map(({ id: templateId, title: templateTitle }) => [templateId, templateTitle]));
         const { requestId, payload } = buildRoutinePayload(body, templateIds, { existing, editing: true });
+        const confirmedFallback = {
+          ...existing,
+          ...payload.routine,
+          id,
+          exercises: payload.routine.exercises.map((exercise, exerciseIndex) => ({
+            ...exercise,
+            index: exerciseIndex,
+            title: templateTitles.get(exercise.exercise_template_id) ?? null,
+            sets: exercise.sets.map((set, setIndex) => ({ ...set, index: setIndex })),
+          })),
+        };
         const hash = payloadHash({ operation: 'update', target: id, payload });
         const ledger = db.prepare('SELECT payload_hash, status, result_json FROM routine_publications WHERE request_id = ?').get(requestId);
         if (ledger) {
@@ -969,14 +1120,27 @@ export async function createService({ dataDir, fetchImpl = globalThis.fetch } = 
         db.prepare('INSERT INTO routine_publications(request_id, payload_hash, status, result_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)').run(requestId, hash, 'pending', null, now, now);
         let routine;
         try {
-          routine = await putRoutine(fetchImpl, apiKey, id, payload);
+          routine = await putRoutine(fetchImpl, apiKey, id, payload, confirmedFallback);
         } catch (error) {
+          // A connection can fail after Hevy commits the PUT. Verify the target
+          // with a read before declaring the write uncertain; never send a
+          // second PUT to discover whether the first one succeeded.
+          if (error?.code === 'routine_uncertain') {
+            try {
+              const remote = await fetchRoutine(fetchImpl, apiKey, id);
+              if (sameRoutineWrite(remote, confirmedFallback)) routine = remote;
+            } catch { /* the durable uncertain ledger remains the safe fallback */ }
+          }
+          if (routine) {
+            // Continue through the ordinary success ledger/cache path below.
+          } else {
           if (['routine_rejected', 'routine_not_found', 'routine_forbidden', 'invalid_key', 'rate_limited'].includes(error?.code)) {
             db.prepare('DELETE FROM routine_publications WHERE request_id = ?').run(requestId);
             throw new ServiceError(error.code, error.message, error.status);
           }
           try { db.prepare('UPDATE routine_publications SET status = ?, updated_at = ? WHERE request_id = ?').run('uncertain', isoNow(), requestId); } catch { /* preserve the no-retry safety boundary */ }
           throw new ServiceError('publication_uncertain', ROUTINE_UPDATE_UNCERTAIN_MESSAGE, 502);
+          }
         }
         // Record success before local caching so a retry cannot repeat the PUT.
         try {
@@ -1080,10 +1244,87 @@ export async function createService({ dataDir, fetchImpl = globalThis.fetch } = 
       if (!result.changes) throw new ServiceError('not_found', 'Program was not found.', 404);
       return { id, deleted: true };
     },
+    getSupplementDoses: supplementDoses,
+    async saveSupplement(body = {}) {
+      return serialiseWrite(async () => {
+        const currentMode = mode(); const today = localDate();
+        const clean = validateSupplement(body, { today, fail });
+        const existing = body.id && safeId(body.id) ? db.prepare('SELECT id, created_at FROM supplements WHERE id = ? AND mode = ?').get(body.id, currentMode) : null;
+        if (body.id && !existing) throw new ServiceError('not_found', 'Supplement was not found.', 404);
+        const id = existing?.id ?? randomUUID(); const now = isoNow(); const created = existing?.created_at ?? now;
+        try {
+          db.exec('BEGIN IMMEDIATE');
+          db.prepare('INSERT INTO supplements(id, mode, name, brand, type, dose_amount, dose_unit, frequency_json, timing, start_date, end_date, purchase_url, package_size, ingredients, notes, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET name=excluded.name, brand=excluded.brand, type=excluded.type, dose_amount=excluded.dose_amount, dose_unit=excluded.dose_unit, frequency_json=excluded.frequency_json, timing=excluded.timing, start_date=excluded.start_date, end_date=excluded.end_date, purchase_url=excluded.purchase_url, package_size=excluded.package_size, ingredients=excluded.ingredients, notes=excluded.notes, updated_at=excluded.updated_at').run(id, currentMode, clean.name, clean.brand, clean.type, clean.dose_amount, clean.dose_unit, json(clean.frequency), clean.timing, clean.start_date, clean.end_date, clean.purchase_url, clean.package_size, clean.ingredients, clean.notes, created, now);
+          // An edit can move a dose off the schedule (a shorter window, fewer
+          // doses a day, another kind); an override left behind would resurrect
+          // a stale skip against a dose that is no longer derived at all. The
+          // surviving set comes from the same pure helpers the reader uses.
+          const edited = { id, ...clean };
+          const removeDose = db.prepare('DELETE FROM supplement_doses WHERE id = ?');
+          if (clean.frequency.kind !== 'workout') db.prepare('DELETE FROM supplement_doses WHERE supplement_id = ? AND workout_id IS NOT NULL').run(id);
+          else {
+            const sessions = new Set(workoutDoses(edited, modeWorkouts(currentMode)).map((dose) => dose.workout_id));
+            for (const row of db.prepare('SELECT id, workout_id FROM supplement_doses WHERE supplement_id = ? AND workout_id IS NOT NULL').all(id)) {
+              if (!sessions.has(row.workout_id)) removeDose.run(row.id);
+            }
+          }
+          const slotRows = db.prepare('SELECT id, slot, date FROM supplement_doses WHERE supplement_id = ? AND slot IS NOT NULL').all(id);
+          if (slotRows.length) {
+            const dates = slotRows.map((row) => row.date).sort();
+            const slots = new Set(scheduledDoses(edited, { from: dates[0], to: dates.at(-1), today }).map((dose) => dose.slot));
+            for (const row of slotRows) if (!slots.has(row.slot)) removeDose.run(row.id);
+          }
+          db.exec('COMMIT');
+        } catch (error) {
+          try { db.exec('ROLLBACK'); } catch { /* no transaction to roll back */ }
+          throw error;
+        }
+        return publicSupplement(supplementRow(id, currentMode), today);
+      });
+    },
+    async deleteSupplement(id) {
+      return serialiseWrite(async () => {
+        if (!safeId(id)) throw new ServiceError('validation', 'Supplement id is invalid.');
+        const result = db.prepare('DELETE FROM supplements WHERE id = ? AND mode = ?').run(id, mode());
+        if (!result.changes) throw new ServiceError('not_found', 'Supplement was not found.', 404);
+        return { id, deleted: true };
+      });
+    },
+    async logDose(supplementId, body = {}) {
+      return serialiseWrite(async () => {
+        if (!safeId(supplementId)) throw new ServiceError('validation', 'Supplement id is invalid.');
+        const currentMode = mode(); const row = supplementRow(supplementId, currentMode);
+        if (!row) throw new ServiceError('not_found', 'Supplement was not found.', 404);
+        const supplement = publicSupplement(row, localDate());
+        const dose = validateDose(body, supplement, { now: new Date(), fail });
+        let workoutTitle = null;
+        if (dose.workout_id) {
+          const workout = modeWorkouts(currentMode).find((item) => item.id === dose.workout_id);
+          if (!workout) throw workoutNotFound();
+          workoutTitle = workout.title ?? null;
+        }
+        // One override per session and per slot: the upsert keys on
+        // (supplement_id, workout_id) or (supplement_id, slot) so the same
+        // derived dose cannot collect two rows.
+        const key = dose.workout_id ? 'workout_id' : 'slot';
+        const existing = dose.workout_id || dose.slot ? db.prepare(`SELECT id, created_at FROM supplement_doses WHERE supplement_id = ? AND ${key} = ?`).get(supplementId, dose.workout_id ?? dose.slot) : null;
+        const id = existing?.id ?? randomUUID(); const created = existing?.created_at ?? isoNow();
+        db.prepare('INSERT INTO supplement_doses(id, supplement_id, taken_at, date, amount, workout_id, slot, note, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET taken_at=excluded.taken_at, date=excluded.date, amount=excluded.amount, note=excluded.note').run(id, supplementId, dose.taken_at, dose.date, dose.amount, dose.workout_id, dose.slot, dose.note, created);
+        return { dose: { id, supplement_id: supplementId, taken_at: dose.taken_at, date: dose.date, amount: dose.amount, unit: supplement.dose_unit, workout_id: dose.workout_id, slot: dose.slot, workout_title: workoutTitle, source: dose.workout_id ? 'workout' : dose.slot ? 'schedule' : 'manual', skipped: dose.amount === 0, note: dose.note } };
+      });
+    },
+    async deleteDose(id) {
+      return serialiseWrite(async () => {
+        if (!safeId(id)) throw new ServiceError('validation', 'Dose id is invalid.');
+        const result = db.prepare('DELETE FROM supplement_doses WHERE id = ? AND supplement_id IN (SELECT id FROM supplements WHERE mode = ?)').run(id, mode());
+        if (!result.changes) throw new ServiceError('not_found', 'Dose was not found.', 404);
+        return { id, deleted: true };
+      });
+    },
     async exportMarkdown() {
       const exportDir = path.join(dataDir, 'exports');
       await mkdir(exportDir, { recursive: true });
-      const contents = { ...markdownFor(state()), 'metrics.md': metricsMarkdown(metrics({ days: 90 })) }; const files = [];
+      const contents = { ...markdownFor(state()), 'metrics.md': metricsMarkdown(metrics({ days: 90 })), 'supplements.md': supplementsMarkdown(supplementDoses({ days: 30 }), supplements(mode())) }; const files = [];
       for (const [name, contentsForFile] of Object.entries(contents)) {
         const target = path.join(exportDir, name); const temp = `${target}.${process.pid}.${randomUUID()}.tmp`;
         await writeFile(temp, `${contentsForFile}\n`, 'utf8'); await rename(temp, target); files.push(`exports/${name}`);

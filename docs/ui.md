@@ -16,7 +16,7 @@ through `mountChart`, which picks full or compact geometry from the measured con
 ## Layout
 
 - Every view: `.view` (grid, one vertical rhythm) → `heading(eyebrow, h1, description, ...actions)`.
-  Eyebrow is the sidebar group (Workout, Metrics, Settings); h1 is the nav label; actions sit in
+  Eyebrow is the sidebar group (Workout, Metrics, Supplements, Settings); h1 is the nav label; actions sit in
   `.view-actions` in the order content selector → range picker → source action.
 - The router renders the demo notice under the header on every route in demo mode. Views never
   render their own demo message.

@@ -26,6 +26,16 @@ function pageCount(json) {
   return Number.isInteger(count) && count >= 0 ? count : null;
 }
 
+async function routineRejection(response) {
+  let detail = '';
+  try {
+    const json = await response.json();
+    if (typeof json?.error === 'string') detail = json.error.replace(/\s+/g, ' ').trim().slice(0, 500);
+  } catch { /* retain the stable fallback for malformed error responses */ }
+  const message = detail ? `Hevy rejected this routine: ${detail}` : 'Hevy rejected this routine. Correct it and try again.';
+  return new HevyError('routine_rejected', message, 400);
+}
+
 async function fetchJson(fetchImpl, url, apiKey) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
@@ -94,6 +104,14 @@ export async function fetchSnapshot(fetchImpl, apiKey) {
   return { workouts, routines, exerciseTemplates };
 }
 
+export async function fetchRoutine(fetchImpl, apiKey, id) {
+  if (typeof id !== 'string' || !id) throw new TypeError('Routine id is required.');
+  const json = await fetchJson(fetchImpl, `${API_BASE}/v1/routines/${encodeURIComponent(id)}`, apiKey);
+  const routine = json?.routine ?? json;
+  if (!routine || typeof routine !== 'object' || routine.id !== id) throw new HevyError('bad_response', 'Hevy returned an invalid routine response.');
+  return routine;
+}
+
 export async function postRoutine(fetchImpl, apiKey, payload) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
@@ -110,7 +128,7 @@ export async function postRoutine(fetchImpl, apiKey, payload) {
     throw new HevyError('routine_uncertain', ROUTINE_UNCERTAIN_MESSAGE, 502);
   }
   try {
-    if (response?.status === 400) throw new HevyError('routine_rejected', 'Hevy rejected this routine. Correct it and try again.', 400);
+    if (response?.status === 400) throw await routineRejection(response);
     if (response?.status === 401) throw new HevyError('invalid_key', 'Hevy rejected the API key.', 401);
     if (response?.status === 403) throw new HevyError('routine_limit', 'Hevy routine limit reached.', 403);
     if (response?.status === 429) throw new HevyError('rate_limited', 'Hevy rate limited the request. Please try again later.', 429);
@@ -129,7 +147,7 @@ export async function postRoutine(fetchImpl, apiKey, payload) {
 
 // Routine edits have a different endpoint and response contract from creates.
 // Keep this separate so callers cannot accidentally turn an edit into a POST.
-export async function updateRoutine(fetchImpl, apiKey, id, payload) {
+export async function updateRoutine(fetchImpl, apiKey, id, payload, confirmedFallback = null) {
   if (typeof id !== 'string' || !id) throw new TypeError('Routine id is required.');
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
@@ -146,15 +164,20 @@ export async function updateRoutine(fetchImpl, apiKey, id, payload) {
     throw new HevyError('routine_uncertain', ROUTINE_UPDATE_UNCERTAIN_MESSAGE, 502);
   }
   try {
-    if (response?.status === 400) throw new HevyError('routine_rejected', 'Hevy rejected this routine. Correct it and try again.', 400);
+    if (response?.status === 400) throw await routineRejection(response);
     if (response?.status === 401) throw new HevyError('invalid_key', 'Hevy rejected the API key.', 401);
     if (response?.status === 404) throw new HevyError('routine_not_found', 'Hevy could not find this routine. Sync to refresh your routines.', 404);
     if (response?.status === 429) throw new HevyError('rate_limited', 'Hevy rate limited the request. Please try again later.', 429);
     if (response?.status === 403) throw new HevyError('routine_forbidden', 'Hevy does not allow this routine update.', 403);
-    if (response?.status >= 500 || response?.status !== 200) throw new HevyError('routine_uncertain', ROUTINE_UPDATE_UNCERTAIN_MESSAGE, 502);
-    const json = await response.json();
+    if (response?.status < 200 || response?.status >= 300) throw new HevyError('routine_uncertain', ROUTINE_UPDATE_UNCERTAIN_MESSAGE, 502);
+    let json;
+    try { json = await response.json(); }
+    catch { return confirmedFallback ?? { id, ...payload.routine }; }
     const routine = json?.routine ?? json;
-    if (!routine || typeof routine !== 'object' || typeof routine.id !== 'string' || !routine.id) throw new HevyError('routine_uncertain', ROUTINE_UPDATE_UNCERTAIN_MESSAGE, 502);
+    // A 2xx response confirms the PUT even if Hevy omits its response
+    // representation. Use the exact submitted routine so Corpus does not
+    // encourage a duplicate retry after a successful remote write.
+    if (!routine || typeof routine !== 'object' || typeof routine.id !== 'string' || !routine.id) return confirmedFallback ?? { id, ...payload.routine };
     if (routine.id !== id) throw new HevyError('routine_uncertain', ROUTINE_UPDATE_UNCERTAIN_MESSAGE, 502);
     return routine;
   } catch (error) {

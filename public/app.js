@@ -11,6 +11,7 @@ import {
 } from "./analytics.js";
 import { invalidateMetrics, renderMetricsDashboard, renderMetricsTrends } from "./metrics.js";
 import { invalidateWorkoutMetrics, renderMetricsWorkouts } from "./metrics-workouts.js";
+import { invalidateSupplementDoses, renderSupplements, renderSupplementsHistory } from "./supplements.js";
 import { workoutMetricsSection } from "./workout-metrics.js";
 import { renderPrograms as renderProgramsModule, renderProgramProgress } from "./programs.js";
 import { localDateKey, matchingPrograms, programTimeline } from "./program-timeline.js";
@@ -144,7 +145,7 @@ function titleCase(value) { return String(value || "").replaceAll("_", " ").repl
 
 function route() {
   const value = location.hash.slice(1).split("/")[0];
-  return ["overview", "sessions", "programs", "proposals", "exercises", "metrics", "metrics-trends", "metrics-workouts", "settings"].includes(value) ? value : "overview";
+  return ["overview", "sessions", "programs", "proposals", "exercises", "metrics", "metrics-trends", "metrics-workouts", "supplements", "supplements-history", "settings"].includes(value) ? value : "overview";
 }
 
 /* ---------------------------------------------------------------- helpers */
@@ -312,6 +313,7 @@ async function setMode(enableDemo, control = modeToggle) {
     await api("/api/demo", { method: "POST", body: JSON.stringify({ enabled: enableDemo }) });
     invalidateMetrics();
     invalidateWorkoutMetrics();
+    invalidateSupplementDoses();
     await loadState();
     const copy = MODE_COPY.toast[enableDemo ? "demo" : "live"];
     toast(copy.title, copy.body);
@@ -340,6 +342,7 @@ async function syncAll() {
       try {
         await api("/api/sync", { method: "POST", body: "{}" });
         invalidateWorkoutMetrics();
+        invalidateSupplementDoses();
         done.push("hevy");
       } catch (error) {
         toast("Couldn’t sync Hevy", error.message || "Please try again.", "error");
@@ -350,6 +353,7 @@ async function syncAll() {
         const result = await api("/api/metrics/sync", { method: "POST", body: "{}" });
         invalidateMetrics();
         invalidateWorkoutMetrics();
+        invalidateSupplementDoses();
         imported = Number(result?.imported) || 0;
         warnings.push(...(Array.isArray(result?.warnings) ? result.warnings.filter(Boolean) : []));
         done.push("google");
@@ -891,6 +895,8 @@ function render() {
     case "metrics": view = renderMetricsDashboard(context()); break;
     case "metrics-trends": view = renderMetricsTrends(context()); break;
     case "metrics-workouts": view = renderMetricsWorkouts(context()); break;
+    case "supplements": view = renderSupplements(context()); break;
+    case "supplements-history": view = renderSupplementsHistory(context()); break;
     case "settings": view = renderSettingsModule(context()); break;
     default: view = renderOverview();
   }

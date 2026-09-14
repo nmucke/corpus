@@ -106,6 +106,14 @@ export function createApp(service, { assistantToken = null } = {}) {
         await service.syncWorkoutMetrics({ workoutIds: [workoutId], budget: 1 });
         return json(res, 200, await service.getWorkoutMetrics(workoutId));
       }
+      // The literal `doses` segment must be matched before /api/supplements/:id
+      // so it is never taken for a supplement id.
+      if (req.method === 'GET' && path === '/api/supplements/doses') return json(res, 200, await service.getSupplementDoses({ days: url.searchParams.has('days') ? Number(url.searchParams.get('days')) : 90 }));
+      const supplementDose = path.match(/^\/api\/supplements\/([^/]+)\/doses$/);
+      if (req.method === 'POST' && supplementDose) {
+        const payload = await body(req);
+        return json(res, 200, await service.logDose(decodeURIComponent(supplementDose[1]), payload));
+      }
       if (req.method === 'POST') {
         const payload = await body(req);
         let result;
@@ -118,6 +126,7 @@ export function createApp(service, { assistantToken = null } = {}) {
           if (typeof payload.enabled !== 'boolean') throw Object.assign(new Error('enabled must be a boolean.'), { status: 400 });
           result = await service.setDemo(payload.enabled);
         } else if (path === '/api/programs') result = await service.saveProgram(payload);
+        else if (path === '/api/supplements') result = await service.saveSupplement(payload);
         else if (path === '/api/routines') result = await service.createRoutine(payload);
         else if (path === '/api/export') result = await service.exportMarkdown();
         else return json(res, 404, { error: 'Not found.' });
@@ -132,6 +141,8 @@ export function createApp(service, { assistantToken = null } = {}) {
         const result = await service.deleteProgram(decodeURIComponent(path.split('/').at(-1)));
         return json(res, 200, result ?? { ok: true });
       }
+      if (req.method === 'DELETE' && /^\/api\/supplements\/doses\/[^/]+$/.test(path)) return json(res, 200, await service.deleteDose(decodeURIComponent(path.split('/').at(-1))));
+      if (req.method === 'DELETE' && /^\/api\/supplements\/[^/]+$/.test(path)) return json(res, 200, await service.deleteSupplement(decodeURIComponent(path.split('/').at(-1))));
       if (path.startsWith('/api/')) return json(res, 404, { error: 'Not found.' });
       if (req.method !== 'GET' && req.method !== 'HEAD') return json(res, 405, { error: 'Method not allowed.' });
       const file = resolve(publicDir, '.' + decodeURIComponent(path === '/' ? '/index.html' : path));

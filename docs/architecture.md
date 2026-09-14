@@ -46,6 +46,11 @@ The browser uses the following loopback-only endpoints. They are intentionally s
 | `GET` | `/api/workouts/:id/metrics` | Read one workout's intra-workout samples, summary, and estimated exercise segments. |
 | `POST` | `/api/workouts/:id/metrics/sync` | Fetch that one workout's padded window from Google Health (no request body). |
 | `GET` | `/api/metrics/workouts?days=90` | Coverage and one metric summary row per workout (`days` clamped to 7–730). |
+| `GET` | `/api/supplements/doses?days=90` | Read logged, scheduled and workout-derived supplement doses for the active mode (`days` clamped to 7–730). |
+| `POST` | `/api/supplements` | Create or update a supplement in the active mode; an optional `id` names the one to update. |
+| `DELETE` | `/api/supplements/:id` | Delete a supplement in the active mode; its doses cascade. |
+| `POST` | `/api/supplements/:id/doses` | Log a dose, or upsert the override for one scheduled slot or logged session. |
+| `DELETE` | `/api/supplements/doses/:id` | Delete one stored dose or override; the derived dose comes back. |
 | `GET` | `/api/session` | Issue the browser review session and CSRF token. |
 | `GET` | `/api/proposals/:id` | Read one proposal and its revision history for review. |
 | `POST` | `/api/proposals/:id/review` | Human review: accept, decline, or request a revision. |
@@ -100,11 +105,24 @@ window was fetched for which workout, with `complete` or `empty` status and a
 failed window writes nothing and is retried. Both tables are live-only; demo
 workout metrics are generated. See [metrics.md](metrics.md).
 
+Schema version 8 adds `supplements` and `supplement_doses` for the Supplements
+module. Both are mode-scoped like programs, through the supplement's `mode`
+column; doses inherit the scope from their supplement and cascade with it. Doses
+implied by a schedule or by training are derived, never stored: a `daily` or
+`weekly` supplement counts one dose per calendar slot and a `workout` one counts
+one per logged session, through today, computed at read time from the schedule
+and the mode's current workouts. A stored row naming a `slot`
+(`'YYYY-MM-DD:n'`, unique per supplement) or a `workout_id` is only an override
+for that one dose — a changed amount, or a zero meaning skipped — so nothing is
+written by a clock or during Hevy sync, and an override whose slot or session no
+longer exists stops matching and is dropped on the next write for that
+supplement. See [supplements.md](supplements.md).
+
 The shared `public/program-timeline.js` helpers derive inclusive end dates, statuses, and session associations. Calendar-day arithmetic avoids daylight-saving drift. A session belongs to each scheduled program with a matching routine ID and a date within the block, using the laptop's timezone. These associations are derived from the current program definition rather than persisted historical assignments. Program edits therefore recalculate them. Program weeks start on the block's start date, independently of the dashboard's Monday-based weeks. Each matching session counts once per program even if multiple days use its routine; overlapping programs may each count it. Program activity excludes future timestamps, and time progress counts calendar days through today rather than measuring adherence.
 
 The current `workouts`, `routines`, and `exercise_templates` table IDs are the corresponding Hevy IDs. `source_items` records the raw source payload for each imported item. A future second workout source will require a deliberate namespaced-ID migration; the workout schema does not pretend to support multiple source systems, unlike the source-namespaced metric tables.
 
-Markdown is the human- and agent-readable layer. `data/exports/` contains generated `overview.md`, `workouts.md`, `routines.md`, `programs.md`, and `metrics.md`. Exports are regenerated from the selected current mode and are not an append-only history. A future knowledge module may introduce `data/knowledge/` with explicit provenance fields; that module is not implemented by the current service.
+Markdown is the human- and agent-readable layer. `data/exports/` contains generated `overview.md`, `workouts.md`, `routines.md`, `programs.md`, `metrics.md`, and `supplements.md`. Exports are regenerated from the selected current mode and are not an append-only history. A future knowledge module may introduce `data/knowledge/` with explicit provenance fields; that module is not implemented by the current service.
 
 ## Hevy sync
 
@@ -194,4 +212,4 @@ CLI selected by the user can send the compact context to its own provider under
 that account's terms. The launcher's restrictions narrow the training session;
 they are not a general operating-system isolation claim.
 
-Body measurements such as weight and body fat are part of the Metrics module. Nutrition, supplements, and knowledge are later modules with their own tables, importers, Markdown conventions, and provenance. They consume shared identity, time, and source conventions rather than coupling directly to the workout tables. Cloud storage, if added, requires deliberate opt-in migrations, explicit credentials, and a documented synchronization policy; it is outside the current application boundary.
+Body measurements such as weight and body fat are part of the Metrics module. Supplements have their own mode-scoped tables and Markdown export and follow the same shared conventions. Nutrition and knowledge are later modules with their own tables, importers, Markdown conventions, and provenance. They consume shared identity, time, and source conventions rather than coupling directly to the workout tables. Cloud storage, if added, requires deliberate opt-in migrations, explicit credentials, and a documented synchronization policy; it is outside the current application boundary.

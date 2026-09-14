@@ -1475,6 +1475,184 @@ details[open] .disclosure-chevron { transform: rotate(90deg); }
 /* A two-option preference is a control, not a full-width slab. */
 .settings-view .segmented { max-width: 430px; }
 
+/* ===== Supplements ===== */
+/* The Stack's today rows and cards, the dose calendar strip shared by both
+   views, and the History adherence rows and dose table. */
+/* The calendar strip and the dose table are wider than a narrow panel; the
+   panel has to be allowed to be narrower than its content for them to scroll. */
+.supplements-view .panel { min-width: 0; }
+
+/* Today: one bordered row per due supplement, with its state on the row. */
+.today-list { display: grid; gap: 6px; }
+.today-list > .label-caps { padding: 12px 0 2px; }
+.today-list > .label-caps:first-child { padding-top: 0; }
+.today-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  padding: 11px 13px;
+  border: 1px solid var(--border-1);
+  border-radius: var(--r-md);
+  background: var(--surface-1);
+}
+.today-row.is-taken { border-color: var(--accent-soft-border); background: var(--accent-soft); }
+.today-row.is-skipped { background: var(--surface-2); }
+.today-row-main { flex: 1 1 180px; min-width: 0; }
+.today-row-main strong { display: block; font-size: var(--fs-300); font-weight: 600; }
+.today-row-main .note { margin-top: 2px; }
+.today-row-actions { display: flex; align-items: center; gap: 8px; margin-left: auto; }
+/* The dose is already logged, so the row reads as a state and the control removes it. */
+.today-status { color: var(--text-2); font-size: var(--fs-200); font-weight: 600; white-space: nowrap; }
+.today-row.is-skipped .today-status { color: var(--text-3); }
+
+/* More than one dose a day: one chip per slot, each with its own action. The
+   chips take a whole line of the wrapping row so a six-a-day stack still fits. */
+.dose-chips { display: flex; flex-wrap: wrap; flex-basis: 100%; gap: 6px; }
+.dose-chip {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 5px 4px 11px;
+  border: 1px solid var(--accent-soft-border);
+  border-radius: var(--r-pill);
+  background: var(--accent-soft);
+}
+.dose-chip.is-skipped { border-color: var(--border-1); background: var(--surface-2); }
+.dose-chip-label { color: var(--text-2); font-size: var(--fs-200); font-weight: 600; white-space: nowrap; }
+
+/* A removed dose keeps the amount that was not taken, struck through. */
+.dose-amount { font-variant-numeric: tabular-nums; }
+.dose-amount.is-skipped { color: var(--text-3); text-decoration: line-through; }
+
+/* The strip: one cell per day, filled when taken, outlined when a dose was
+   expected and missed, and a faint tick when the day expected nothing. On a
+   card the columns share the width so 30 days fit at 390px; in History they
+   keep a fixed width and scroll inside `.dose-calendar-scroll`. */
+.dose-calendar {
+  display: grid;
+  grid-auto-flow: column;
+  grid-auto-columns: minmax(0, 1fr);
+  gap: 2px;
+  min-width: 0;
+}
+.dose-calendar--wide { grid-auto-columns: 11px; }
+.dose-calendar-scroll { position: relative; min-width: 0; overflow-x: auto; padding-bottom: 3px; }
+.dose-cell {
+  height: 17px;
+  border: 1px solid transparent;
+  border-radius: var(--r-xs);
+  background: var(--surface-2);
+}
+.dose-cell.is-taken { border-color: var(--lime-dark); background: var(--lime-dark); }
+.dose-cell.is-missed { border-color: var(--border-2); background: transparent; }
+
+/* Cards: one gap instead of the per-element margins the shared card rules give. */
+.supplement-card { gap: 9px; }
+.supplement-card .card-meta { display: flex; flex-wrap: wrap; gap: 8px; margin: 0; }
+.supplement-card .card-actions { padding-top: 6px; }
+.supplement-ended > summary {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  padding: 4px 0 var(--gap);
+  cursor: pointer;
+  list-style: none;
+}
+.supplement-ended > summary::-webkit-details-marker { display: none; }
+.supplement-ended > summary .card-meta { margin: 0; }
+.supplement-ended > summary .disclosure-chevron { margin-left: auto; }
+
+/* Read dialog: pills, the fact list and the prose sections. */
+.supplement-pills { display: flex; flex-wrap: wrap; gap: 6px; }
+.supplement-facts { display: grid; grid-template-columns: minmax(90px, auto) minmax(0, 1fr); gap: 8px var(--gap); margin: 0; }
+.supplement-facts dt {
+  padding-top: 2px;
+  color: var(--text-3);
+  font-size: var(--fs-caps);
+  font-weight: 700;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+.supplement-facts dd { margin: 0; font-size: var(--fs-300); }
+.supplement-prose { display: grid; gap: 8px; }
+.supplement-prose h3 { margin: 0; }
+.dose-list { display: grid; }
+.dose-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 10px;
+  padding: 8px 0;
+  border-top: 1px solid var(--border-1);
+  font-size: var(--fs-300);
+}
+.dose-row:first-child { border-top: 0; }
+.dose-row > .note { margin-left: auto; }
+
+/* History: one adherence row per supplement, then the dose table. */
+.adherence-list { display: grid; gap: var(--gap); }
+.adherence-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 9px 12px;
+  padding-bottom: var(--gap);
+  border-bottom: 1px solid var(--border-1);
+}
+.adherence-row:last-child { padding-bottom: 0; border-bottom: 0; }
+.adherence-head, .adherence-row > .dose-calendar-scroll { grid-column: 1 / -1; }
+.adherence-head { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 4px 10px; }
+.adherence-head strong { font-size: var(--fs-300); font-weight: 600; }
+.adherence-figure { color: var(--text-2); font-size: var(--fs-200); font-weight: 700; font-variant-numeric: tabular-nums; }
+.adherence-bar {
+  appearance: none;
+  width: 100%;
+  height: 8px;
+  border: 0;
+  border-radius: var(--r-pill);
+  background: var(--surface-3);
+}
+.adherence-bar::-webkit-progress-bar { border-radius: var(--r-pill); background: var(--surface-3); }
+.adherence-bar::-webkit-progress-value { border-radius: var(--r-pill); background: var(--lime-dark); }
+.adherence-bar::-moz-progress-bar { border-radius: var(--r-pill); background: var(--lime-dark); }
+
+/* `position: relative` keeps the wide table inside this container's own
+   scrollable region; without it the overflow leaks into the page's. */
+.dose-table-scroll { position: relative; overflow-x: auto; }
+.dose-table { min-width: 640px; }
+.dose-table th:nth-child(2), .dose-table td:nth-child(2),
+.dose-table th:nth-child(4), .dose-table td:nth-child(4),
+.dose-table th:nth-child(5), .dose-table td:nth-child(5) { text-align: left; }
+/* The narrowest column that still keeps its one action on a single line. */
+.dose-table-action { width: 1%; padding-left: var(--gap); white-space: nowrap; }
+/* A date banner inside the body, not a second header row. */
+.dose-group th { padding-top: 17px; color: var(--text-2); font-size: var(--fs-200); letter-spacing: 0.04em; text-align: left; }
+.dose-table tbody > .dose-group:first-child th { padding-top: 7px; }
+/* The pager is the panel's own last child, and a block panel has no gap of its
+   own, so it would otherwise sit on the table's closing rule. */
+.dose-table-scroll + .button { margin-top: var(--gap); }
+
+/* Editor: the two-up field row and the weekday toggle group. */
+.field-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 148px), 1fr)); align-items: start; gap: var(--gap); }
+.weekday-group { display: flex; flex-wrap: wrap; gap: 6px; }
+.weekday {
+  min-width: 48px;
+  min-height: 34px;
+  padding: 0 9px;
+  border: 1px solid var(--border-2);
+  border-radius: var(--r-sm);
+  background: var(--surface-1);
+  color: var(--text-2);
+  font: inherit;
+  font-size: var(--fs-200);
+  font-weight: 600;
+  cursor: pointer;
+}
+.weekday[aria-pressed="true"] { border-color: var(--forest); background: var(--forest); color: var(--on-forest-1); }
+.weekday:focus-visible { outline: var(--focus-ring); outline-offset: var(--focus-offset); }
+
 /* ===== Markdown ===== */
 .markdown-body {
   min-width: 0;
