@@ -2,6 +2,7 @@
   "name": "corpus",
   "version": "0.1.0",
   "private": true,
+  "license": "MIT",
   "type": "module",
   "description": "A local-first home for your training data and health knowledge.",
   "engines": { "node": ">=24.0.0" },

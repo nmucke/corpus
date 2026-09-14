@@ -1,5 +1,12 @@
 # corpus
 
+[![CI](https://github.com/nmucke/corpus/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/nmucke/corpus/actions/workflows/ci.yml)
+[![Version](https://img.shields.io/badge/version-0.1.0-blue)](package.json)
+[![Node.js](https://img.shields.io/badge/Node.js-%E2%89%A524-339933?logo=nodedotjs&logoColor=white)](https://nodejs.org/)
+[![Runtime dependencies](https://img.shields.io/badge/runtime_dependencies-0-brightgreen)](package.json)
+[![Local first](https://img.shields.io/badge/data-local--first-7c3aed)](#local-data)
+[![License: MIT](https://img.shields.io/badge/license-MIT-yellow.svg)](LICENSE)
+
 corpus is a local-first training and health data workbench. The current release is deliberately narrow and includes:
 
 - Hevy workout sessions, routines, and exercise templates imported through a read-only full snapshot;
