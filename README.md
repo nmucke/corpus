@@ -3,6 +3,7 @@
 [![CI](https://github.com/nmucke/corpus/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/nmucke/corpus/actions/workflows/ci.yml)
 [![Version](https://img.shields.io/badge/version-0.1.0-blue)](package.json)
 [![Node.js](https://img.shields.io/badge/Node.js-%E2%89%A524-339933?logo=nodedotjs&logoColor=white)](https://nodejs.org/)
+[![MCP](https://img.shields.io/badge/MCP-compatible-5A45FF)](https://modelcontextprotocol.io/)
 [![Runtime dependencies](https://img.shields.io/badge/runtime_dependencies-0-brightgreen)](package.json)
 [![Local first](https://img.shields.io/badge/data-local--first-7c3aed)](#local-data)
 [![License: MIT](https://img.shields.io/badge/license-MIT-yellow.svg)](LICENSE)
@@ -59,8 +60,31 @@ bounded Corpus context through its local MCP server and can save a proposal. It
 cannot sync, change settings, edit code, run SQL, approve a proposal, or publish
 to Hevy. Review and publishing stay in the Corpus interface.
 
-Start Corpus first, then launch one personal CLI from a terminal in this
-repository:
+For ChatGPT Desktop or Claude Cowork in the Claude Desktop app, run the one-time
+local setup after starting Corpus:
+
+```sh
+npm start
+# in another terminal, once per installation or checkout location
+npm run assistant:setup
+```
+
+The setup command prints the exact local STDIO values for **ChatGPT Desktop →
+Settings → MCP servers → Add server** and creates a ready-to-upload Claude
+plugin under ignored `data/assistant-apps/`. Upload that zip from **Claude
+Desktop → Cowork → Customize → Plugins**. Restart the relevant desktop app,
+then use Corpus from a normal chat or Cowork task while `npm start` remains
+running. The local bridge reads the existing Corpus assistant credential; no
+token is copied into either app configuration.
+
+This support is deliberately desktop-local. ChatGPT web/mobile and cloud Cowork
+cannot use this loopback integration. App sessions also retain any other tools
+or folders enabled in the app, so use a dedicated chat/task and disable
+unrelated tools when you want the narrowest scope. The Corpus server itself
+still exposes only its bounded training tools, and its only write operation
+saves a reviewable draft.
+
+The restricted CLI launchers remain available as an alternative:
 
 ```sh
 npm run assistant:codex
@@ -81,7 +105,7 @@ personal subscription or Console account; see its
 [quickstart](https://code.claude.com/docs/en/quickstart) and
 [authentication guide](https://code.claude.com/docs/en/authentication).
 
-The launcher copies only `assistant/` into a temporary workspace. It keeps the
+The CLI launcher copies only `assistant/` into a temporary workspace. It keeps the
 CLI's normal personal login location and does not edit global configuration.
 For Codex it requires ChatGPT authentication, read-only sandboxing, the Corpus
 MCP server, and no shell or other MCP tools. For Claude it starts with only

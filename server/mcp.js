@@ -5,6 +5,35 @@ const PROTOCOL_VERSIONS = new Set(['2024-11-05', '2025-03-26', '2025-06-18', '20
 const LATEST_PROTOCOL_VERSION = '2025-11-25';
 const DEFAULT_FETCH_TIMEOUT_MS = 10_000;
 
+export const DEFAULT_SERVER_INSTRUCTIONS = 'Corpus training assistant. Work only through the Corpus MCP tools. Start with corpus_summary and keep queries bounded. Use corpus_workflow for the relevant detailed workflow. Never approve, decline, publish, sync, change settings, access files, execute SQL, or call Hevy. corpus_submit_proposal only saves a draft for human review.';
+
+const TOOL_TITLES = Object.freeze({
+  corpus_summary: 'Summarize Corpus training data',
+  corpus_search_exercises: 'Search exercise templates',
+  corpus_list_routines: 'List routines',
+  corpus_get_routine: 'Get routine details',
+  corpus_list_programs: 'List programs',
+  corpus_get_program: 'Get program details',
+  corpus_workout_summary: 'Summarize workout progress',
+  corpus_muscle_coverage: 'Analyze muscle coverage',
+  corpus_list_proposals: 'List training proposals',
+  corpus_get_proposal: 'Get proposal details',
+  corpus_submit_proposal: 'Save a draft proposal',
+  corpus_get_profile: 'Get training profile',
+  corpus_workflow: 'Load a Corpus workflow',
+});
+
+export const MCP_TOOLS = Object.freeze(ASSISTANT_TOOLS.map((tool) => Object.freeze({
+  ...tool,
+  title: TOOL_TITLES[tool.name],
+  annotations: Object.freeze({
+    readOnlyHint: tool.name !== 'corpus_submit_proposal',
+    destructiveHint: false,
+    idempotentHint: tool.name !== 'corpus_submit_proposal',
+    openWorldHint: false,
+  }),
+})));
+
 export function assistantOrigin(value = process.env.CORPUS_ASSISTANT_URL || 'http://127.0.0.1:3210') {
   let url;
   try { url = new URL(value); } catch { throw new Error('CORPUS_ASSISTANT_URL must be a loopback HTTP origin.'); }
@@ -21,14 +50,15 @@ function failure(id, code, message, data = undefined) { return { jsonrpc: '2.0',
 function isObject(value) { return value && typeof value === 'object' && !Array.isArray(value); }
 function isRequest(value) { return isObject(value) && value.jsonrpc === '2.0' && typeof value.method === 'string'; }
 function toolResult(value, isError = false) {
-  return { content: [{ type: 'text', text: JSON.stringify(value) }], ...(isError ? { isError: true } : {}) };
+  return { content: [{ type: 'text', text: JSON.stringify(value) }], structuredContent: value, ...(isError ? { isError: true } : {}) };
 }
 function toolByName(name) { return ASSISTANT_TOOLS.find((tool) => tool.name === name); }
 
-export function createMcpHandler({ fetchImpl = globalThis.fetch, origin = assistantOrigin(), token = process.env.CORPUS_ASSISTANT_TOKEN, timeoutMs = DEFAULT_FETCH_TIMEOUT_MS } = {}) {
+export function createMcpHandler({ fetchImpl = globalThis.fetch, origin = assistantOrigin(), token = process.env.CORPUS_ASSISTANT_TOKEN, timeoutMs = DEFAULT_FETCH_TIMEOUT_MS, instructions = DEFAULT_SERVER_INSTRUCTIONS } = {}) {
   if (typeof fetchImpl !== 'function') throw new TypeError('fetch is required.');
   if (typeof token !== 'string' || !token.trim()) throw new Error('CORPUS_ASSISTANT_TOKEN is required.');
   if (!Number.isInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 60_000) throw new TypeError('timeoutMs must be an integer from 1 to 60000.');
+  if (typeof instructions !== 'string' || !instructions.trim() || instructions.length > 16_000) throw new TypeError('instructions must be non-empty text no longer than 16000 characters.');
   const target = assistantOrigin(origin);
   return async function handle(message) {
     if (!isRequest(message)) return failure(message?.id, -32600, 'Invalid Request.');
@@ -42,10 +72,10 @@ export function createMcpHandler({ fetchImpl = globalThis.fetch, origin = assist
       // version when the client offers an unknown revision; the client then
       // decides whether it can continue with that version.
       const protocolVersion = PROTOCOL_VERSIONS.has(params.protocolVersion) ? params.protocolVersion : LATEST_PROTOCOL_VERSION;
-      return response(id, { protocolVersion, capabilities: { tools: {} }, serverInfo: { name: 'corpus-assistant', version: '0.1.0' } });
+      return response(id, { protocolVersion, capabilities: { tools: {} }, serverInfo: { name: 'corpus-assistant', version: '0.1.0' }, instructions });
     }
     if (method === 'ping') return notification ? undefined : response(id, {});
-    if (method === 'tools/list') return notification ? undefined : response(id, { tools: ASSISTANT_TOOLS });
+    if (method === 'tools/list') return notification ? undefined : response(id, { tools: MCP_TOOLS });
     if (method !== 'tools/call') return notification ? undefined : failure(id, -32601, 'Method not found.');
     if (!isObject(params) || typeof params.name !== 'string' || !toolByName(params.name) || (params.arguments !== undefined && !isObject(params.arguments))) return notification ? undefined : failure(id, -32602, 'Invalid tool request.');
     const controller = new AbortController();

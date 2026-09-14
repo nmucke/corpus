@@ -6,9 +6,13 @@ test('MCP initializes, lists tools, and ignores initialized notification', async
   const handler = createMcpHandler({ token: 'opaque-token', origin: 'http://127.0.0.1:3210', fetchImpl: async () => new Response('{}') });
   const initialized = await handler({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-03-26' } });
   assert.equal(initialized.result.protocolVersion, '2025-03-26');
+  assert.match(initialized.result.instructions, /human review/);
   assert.equal((await handler({ jsonrpc: '2.0', method: 'notifications/initialized' })), undefined);
   const tools = await handler({ jsonrpc: '2.0', id: 2, method: 'tools/list' });
   assert.ok(tools.result.tools.some((tool) => tool.name === 'corpus_workflow'));
+  assert.equal(tools.result.tools.find((tool) => tool.name === 'corpus_summary').annotations.readOnlyHint, true);
+  assert.equal(tools.result.tools.find((tool) => tool.name === 'corpus_submit_proposal').annotations.readOnlyHint, false);
+  assert.ok(tools.result.tools.every((tool) => tool.annotations.destructiveHint === false && tool.annotations.openWorldHint === false));
 });
 
 test('MCP accepts current lifecycle versions and negotiates a supported fallback', async () => {
@@ -31,6 +35,7 @@ test('MCP calls only known local tools and does not disclose bearer credentials'
   assert.equal(request.options.redirect, 'error');
   assert.ok(request.options.signal instanceof AbortSignal);
   assert.equal(result.result.content[0].text.includes('opaque-token'), false);
+  assert.deepEqual(result.result.structuredContent, { profile: { summary: 'ok' } });
   const bad = await handler({ jsonrpc: '2.0', id: 'b', method: 'tools/call', params: { name: 'fs.read', arguments: {} } });
   assert.equal(bad.error.code, -32602);
 });

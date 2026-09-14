@@ -3,10 +3,61 @@
 The Corpus training assistant is for training analysis and reviewable planning.
 It is deliberately separate from the repository's development-agent role. The
 repository root `AGENTS.md` governs development; the training-only instructions
-and skills are in `assistant/` and are copied into a temporary workspace for a
-session. They are never installed as global skills.
+and skills are in `assistant/`. Restricted CLI sessions copy them into a
+temporary workspace; desktop support packages matching copies as a local app
+plugin. They are never placed in global agent-skill directories.
 
-## Start a session
+## Use a desktop app
+
+ChatGPT Desktop and desktop-local Claude Cowork can use Corpus without launching
+a separate CLI session. Keep the local Corpus server running:
+
+```sh
+npm start
+```
+
+Run the one-time setup command from this repository:
+
+```sh
+npm run assistant:setup
+```
+
+It does two local-only things:
+
+1. Prints the Node executable, bridge path, working directory, and environment
+   values to enter under **ChatGPT Desktop → Settings → MCP servers → Add
+   server**. Choose STDIO, save, and restart ChatGPT. The desktop app and local
+   Codex clients share this MCP configuration.
+2. Packages `plugins/corpus-assistant/` as
+   `data/assistant-apps/corpus-assistant-claude.zip`, with absolute paths for
+   this checkout. Upload it from **Claude Desktop → Cowork → Customize →
+   Plugins**, then restart Claude Desktop. Re-run setup and replace the plugin
+   after moving the repository, changing Node installations, or changing
+   `PORT` / `CORPUS_DATA_DIR`.
+
+The app bridge is `server/mcp-local.js`. It obtains the existing bearer
+credential from the selected local data directory and loads the training role
+from `assistant/AGENTS.md`; the token is not written into the plugin or printed.
+The Claude plugin also contains the four scoped workflows. ChatGPT receives the
+same top-level behavior through MCP server instructions and can retrieve a
+workflow with `corpus_workflow`.
+
+After the one-time setup, only `npm start` is required. Try “Analyze my last
+eight weeks of training in Corpus” or “Draft a three-day program for review in
+Corpus” in a new desktop chat/task.
+
+This integration is intentionally local-only:
+
+- ChatGPT on the web or mobile does not read the desktop MCP configuration.
+- Claude web/mobile and cloud Cowork cannot reach this loopback MCP server; use
+  Cowork in Claude Desktop.
+- Desktop app sessions are not isolated like the CLI launchers below. The app
+  may retain other enabled tools, plugins, or Cowork folder access. Use a
+  dedicated session and disable unrelated capabilities when narrow client-side
+  scope matters. The Corpus server boundary still rejects every unregistered
+  operation and cannot approve, publish, sync, change settings, or call Hevy.
+
+## Use a restricted CLI session
 
 Keep the local Corpus server running in one terminal:
 
@@ -84,7 +135,10 @@ server-owned skill files, not a path-reading facility.
 MCP lifecycle negotiation through `2025-11-25`, ignores
 `notifications/initialized`, accepts at most 256 KB per input message, writes
 protocol messages only to stdout, and uses a fixed loopback HTTP origin. It
-never calls an AI API. Its bearer POST has a timeout and refuses redirects.
+advertises server-wide training instructions, human-readable tool titles,
+read/write and destructive-operation hints, and structured JSON results for
+desktop clients. It never calls an AI API. Its bearer POST has a timeout and
+refuses redirects.
 
 The bridge is only a client of this local endpoint:
 

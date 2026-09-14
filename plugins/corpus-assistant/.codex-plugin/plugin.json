@@ -1,0 +1,25 @@
+{
+  "name": "corpus-assistant",
+  "version": "0.1.0",
+  "description": "Local training analysis and reviewable planning workflows for Corpus.",
+  "author": {
+    "name": "Corpus contributors"
+  },
+  "repository": "https://github.com/nmucke/corpus",
+  "license": "MIT",
+  "keywords": ["training", "fitness", "local-first"],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Corpus Assistant",
+    "shortDescription": "Analyze training and draft reviewable plans.",
+    "longDescription": "Use bounded local Corpus data to analyze training or save routine and program drafts for human review.",
+    "developerName": "Corpus contributors",
+    "category": "Health & Fitness",
+    "capabilities": ["Read", "Write"],
+    "defaultPrompt": [
+      "Analyze my recent training in Corpus.",
+      "Draft a routine for review in Corpus.",
+      "Revise my requested Corpus proposal."
+    ]
+  }
+}

@@ -13,6 +13,7 @@
     "sync": "node server/cli.js sync",
     "export": "node server/cli.js export",
     "status": "node server/cli.js status",
+    "assistant:setup": "node scripts/assistant-apps.js",
     "assistant:codex": "node scripts/assistant.js codex",
     "assistant:claude": "node scripts/assistant.js claude"
   }

@@ -1,0 +1,44 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
+  "name": "corpus-assistant",
+  "displayName": "Corpus Assistant",
+  "version": "0.1.0",
+  "description": "Use local Corpus training data for analysis and reviewable planning.",
+  "author": {
+    "name": "Corpus contributors"
+  },
+  "repository": "https://github.com/nmucke/corpus",
+  "license": "MIT",
+  "keywords": ["training", "fitness", "local-first"],
+  "userConfig": {
+    "node_path": {
+      "type": "file",
+      "title": "Node.js executable",
+      "description": "Absolute path to a Node.js 24 or newer executable.",
+      "required": true
+    },
+    "corpus_root": {
+      "type": "directory",
+      "title": "Corpus folder",
+      "description": "Absolute path to the local Corpus repository.",
+      "required": true
+    },
+    "assistant_url": {
+      "type": "string",
+      "title": "Corpus URL",
+      "description": "Loopback URL used by the running local Corpus server.",
+      "default": "http://127.0.0.1:3210",
+      "required": true
+    }
+  },
+  "mcpServers": {
+    "corpus": {
+      "command": "${user_config.node_path}",
+      "args": ["${user_config.corpus_root}/server/mcp-local.js"],
+      "cwd": "${user_config.corpus_root}",
+      "env": {
+        "CORPUS_ASSISTANT_URL": "${user_config.assistant_url}"
+      }
+    }
+  }
+}

@@ -2,22 +2,23 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { createInterface } from 'node:readline';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { once } from 'node:events';
 import { createService } from '../server/service.js';
 import { createApp } from '../server/index.js';
 
-test('native stdio bridge submits a draft that only the browser can accept', { timeout: 10000 }, async t => {
+test('desktop stdio bridge loads its local credential and submits a browser-reviewed draft', { timeout: 10000 }, async t => {
   const dataDir = await mkdtemp(path.join(os.tmpdir(), 'corpus-mcp-e2e-'));
   const service = await createService({ dataDir });
-  const token = 'isolated-test-credential';
+  const token = 'b'.repeat(64);
+  await writeFile(path.join(dataDir, 'assistant-token'), `${token}\n`, { mode: 0o600 });
   const server = createApp(service, { assistantToken: token });
   t.after(async () => { server.closeAllConnections(); await new Promise(resolve => server.close(resolve)); service.close(); await rm(dataDir, { recursive: true, force: true }); });
   server.listen(0, '127.0.0.1'); await once(server, 'listening');
   const origin = `http://127.0.0.1:${server.address().port}`;
-  const child = spawn(process.execPath, [path.resolve('server/mcp.js')], { env: { ...process.env, CORPUS_ASSISTANT_URL: origin, CORPUS_ASSISTANT_TOKEN: token }, stdio: ['pipe', 'pipe', 'pipe'] });
+  const child = spawn(process.execPath, [path.resolve('server/mcp-local.js')], { env: { ...process.env, CORPUS_ASSISTANT_URL: origin, CORPUS_DATA_DIR: dataDir, CORPUS_ASSISTANT_TOKEN: '' }, stdio: ['pipe', 'pipe', 'pipe'] });
   t.after(() => child.kill());
   const lines = createInterface({ input: child.stdout });
   let nextId = 0;

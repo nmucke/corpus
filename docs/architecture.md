@@ -191,13 +191,22 @@ selecting the complete data directory through `CORPUS_DATA_DIR`.
 
 ## Training assistant and future modules
 
-The optional training assistant is a separate runtime workspace, not a developer
-agent in the repository. `scripts/assistant.js` copies `assistant/` to a
+The optional training assistant is a separate role, not a development agent in
+the repository. Restricted CLI sessions use `scripts/assistant.js`, which copies `assistant/` to a
 temporary directory, starts a personal native Codex or Claude Code CLI there,
 and connects only the fixed Corpus MCP bridge. The four scoped skills cover
 analysis, routine design, program design, and proposal revision. The model sees
 compact summaries and paginated detail, rather than arbitrary database or file
 access. Its only write is saving a reviewable proposal.
+
+ChatGPT Desktop and desktop-local Claude Cowork can instead start
+`server/mcp-local.js` through app configuration. That entry point reads the
+existing credential from the selected data directory and supplies the same
+training instructions through MCP initialization. `scripts/assistant-apps.js`
+prints the ChatGPT STDIO settings and packages the shared workflows as a local
+Claude plugin without embedding the credential or any training data. These app
+sessions retain their host's other enabled capabilities, unlike the restricted
+CLI launchers; the server-side MCP authorization boundary is identical.
 
 Proposal acceptance is local and atomic: an accepted draft can create or update
 local routine overlays and programs but does not contact Hevy. Publishing an
@@ -208,8 +217,8 @@ new remote routine. Proposals use revisions and visible-entity hashes, so stale
 targets and competing revisions are rejected. Details are in [assistant.md](assistant.md).
 
 Corpus does not invoke an AI model or upload training data by itself. The native
-CLI selected by the user can send the compact context to its own provider under
-that account's terms. The launcher's restrictions narrow the training session;
-they are not a general operating-system isolation claim.
+app or CLI selected by the user can send the compact context to its own provider
+under that account's terms. The CLI launcher's restrictions narrow its training
+session; they are not a general operating-system isolation claim.
 
 Body measurements such as weight and body fat are part of the Metrics module. Supplements have their own mode-scoped tables and Markdown export and follow the same shared conventions. Nutrition and knowledge are later modules with their own tables, importers, Markdown conventions, and provenance. They consume shared identity, time, and source conventions rather than coupling directly to the workout tables. Cloud storage, if added, requires deliberate opt-in migrations, explicit credentials, and a documented synchronization policy; it is outside the current application boundary.
